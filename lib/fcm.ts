@@ -4,7 +4,8 @@
  * Sends push notifications to users with proper lock screen support
  */
 
-import { messaging, usersRef } from './firebase';
+import { messaging, usersRef, notificationsRef } from './firebase';
+import * as admin from 'firebase-admin';
 
 // Notification types for different scenarios
 export type NotificationType = 
@@ -16,7 +17,14 @@ export type NotificationType =
   | 'buzzer_triggered'    // Buzzer was activated
   | 'clothes_ready'       // Washing done, collect clothes
   | 'session_started'     // Successfully started session
-  | 'session_ended';      // Session ended
+  | 'session_ended'       // Session ended
+  | 'queue_joined'        // Joined queue
+  | 'queue_left'          // Left queue
+  | 'chat_message'        // New chat message
+  | 'voice_call'          // Incoming voice call
+  | 'video_call'          // Incoming video call
+  | 'missed_call'         // Missed voice call
+  | 'missed_video';       // Missed video call
 
 interface NotificationPayload {
   userId: string;
@@ -26,6 +34,7 @@ interface NotificationPayload {
   data?: Record<string, string>;
   sound?: 'default' | 'alarm' | 'urgent';
   priority?: 'normal' | 'high';
+  channelId?: string;
 }
 
 /**
@@ -48,7 +57,16 @@ async function getUserFcmToken(userId: string): Promise<string | null> {
  * Send push notification to a user
  */
 export async function sendNotification(payload: NotificationPayload): Promise<boolean> {
-  const { userId, type, title, body, data = {}, sound = 'default', priority = 'high' } = payload;
+  const { 
+    userId, 
+    type, 
+    title, 
+    body, 
+    data = {}, 
+    sound = 'default', 
+    priority = 'high',
+    channelId 
+  } = payload;
 
   try {
     const fcmToken = await getUserFcmToken(userId);
@@ -57,11 +75,60 @@ export async function sendNotification(payload: NotificationPayload): Promise<bo
       return false;
     }
 
-    // Determine sound file based on type
-    const soundFile = sound === 'alarm' ? 'alarm_loop.wav' : 
-                      sound === 'urgent' ? 'urgent.wav' : 'default';
+    // Check if it's an Expo token
+    if (fcmToken.startsWith('ExponentPushToken')) {
+      // Send via Expo Push Notification Service
+      const message = {
+        to: fcmToken,
+        sound: sound === 'alarm' ? 'default' : sound,
+        title,
+        body,
+        data: {
+          type,
+          ...data,
+        },
+        priority: priority === 'high' ? 'high' : 'normal',
+      };
 
-    const message = {
+      const response = await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(message),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Expo push failed: ${errorText}`);
+      }
+
+      console.log(`Expo notification sent to ${userId}: ${type}`);
+      return true;
+    }
+
+    // Determine channel and sound based on type
+    let androidChannel = channelId || 'default';
+    let soundFile = 'default';
+    
+    if (sound === 'alarm') {
+      soundFile = 'alarm.mp3';
+      androidChannel = channelId || 'critical';
+    } else if (sound === 'urgent') {
+      soundFile = 'urgent.mp3';
+      androidChannel = channelId || 'urgent';
+    }
+
+    // Special channels for specific types
+    if (type === 'chat_message') {
+      androidChannel = 'chat';
+    } else if (type === 'voice_call' || type === 'video_call') {
+      androidChannel = 'calls';
+      soundFile = 'alarm.mp3';
+    }
+
+    const message: any = {
       token: fcmToken,
       notification: {
         title,
@@ -75,12 +142,12 @@ export async function sendNotification(payload: NotificationPayload): Promise<bo
       android: {
         priority: priority as 'normal' | 'high',
         notification: {
-          channelId: priority === 'high' ? 'urgent_alerts' : 'general',
+          channelId: androidChannel,
           sound: soundFile,
           defaultSound: sound === 'default',
           defaultVibrateTimings: true,
           notificationCount: 1,
-          visibility: 'public' as const, // Show on lock screen
+          visibility: 'public' as const,
         },
       },
       apns: {
@@ -89,11 +156,9 @@ export async function sendNotification(payload: NotificationPayload): Promise<bo
         },
         payload: {
           aps: {
-            sound: sound === 'alarm' ? { 
-              critical: 1, 
-              name: 'alarm_loop.caf', 
-              volume: 1.0 
-            } : soundFile,
+            sound: sound === 'alarm' 
+              ? { critical: true, name: 'alarm.mp3', volume: 1.0 } 
+              : soundFile,
             badge: 1,
             'content-available': 1,
             'mutable-content': 1,
@@ -113,6 +178,50 @@ export async function sendNotification(payload: NotificationPayload): Promise<bo
 }
 
 /**
+ * Store notification in Firestore for history
+ * Uses Firestore Timestamp for proper date handling
+ */
+export async function storeNotification(
+  userId: string,
+  type: NotificationType,
+  title: string,
+  body: string,
+  data?: Record<string, string>
+): Promise<string> {
+  const notification = {
+    userId,
+    type,
+    title,
+    body,
+    data: data || {},
+    read: false,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  const docRef = await notificationsRef.add(notification);
+  return docRef.id;
+}
+
+/**
+ * Send notification and store in Firestore
+ */
+export async function sendAndStoreNotification(payload: NotificationPayload): Promise<{
+  sent: boolean;
+  notificationId: string;
+}> {
+  const [sent, notificationId] = await Promise.all([
+    sendNotification(payload),
+    storeNotification(payload.userId, payload.type, payload.title, payload.body, payload.data),
+  ]);
+
+  return { sent, notificationId };
+}
+
+// ============================================
+// Convenience functions for specific notifications
+// ============================================
+
+/**
  * Send "Your Turn" notification with alarm sound
  */
 export async function notifyYourTurn(userId: string, machineId: string): Promise<boolean> {
@@ -122,7 +231,7 @@ export async function notifyYourTurn(userId: string, machineId: string): Promise
     title: '🎉 Your Turn!',
     body: `Machine ${machineId} is ready for you. You have 5 minutes to scan the QR code.`,
     data: { machineId },
-    sound: 'alarm',  // Loops on lock screen
+    sound: 'alarm',
     priority: 'high',
   });
 }
@@ -224,7 +333,7 @@ export async function notifyClothesReady(userId: string, machineId: string): Pro
     title: '👕 Clothes Ready!',
     body: `Your laundry at Machine ${machineId} is done. Please collect your clothes.`,
     data: { machineId },
-    sound: 'alarm',  // Ring until collected
+    sound: 'alarm',
     priority: 'high',
   });
 }
@@ -260,42 +369,98 @@ export async function notifySessionEnded(userId: string, machineId: string): Pro
 }
 
 /**
- * Store notification in Firestore for history
+ * Notify queue joined
  */
-export async function storeNotification(
-  userId: string,
-  type: NotificationType,
-  title: string,
-  body: string,
-  data?: Record<string, string>
-): Promise<string> {
-  const { notificationsRef } = await import('./firebase');
-  
-  const notification = {
+export async function notifyQueueJoined(userId: string, machineId: string, position: number): Promise<boolean> {
+  return sendNotification({
     userId,
-    type,
-    title,
-    body,
-    data: data || {},
-    read: false,
-    created_at: new Date().toISOString(),
-  };
-
-  const docRef = await notificationsRef.add(notification);
-  return docRef.id;
+    type: 'queue_joined',
+    title: '✅ Joined Queue',
+    body: `You are #${position} in line for Machine ${machineId}.`,
+    data: { machineId, position: position.toString() },
+    sound: 'default',
+    priority: 'normal',
+  });
 }
 
 /**
- * Send notification and store in Firestore
+ * Notify new chat message
  */
-export async function sendAndStoreNotification(payload: NotificationPayload): Promise<{
-  sent: boolean;
-  notificationId: string;
-}> {
-  const [sent, notificationId] = await Promise.all([
-    sendNotification(payload),
-    storeNotification(payload.userId, payload.type, payload.title, payload.body, payload.data),
-  ]);
+export async function notifyChatMessage(
+  userId: string, 
+  senderName: string, 
+  message: string,
+  machineId: string
+): Promise<boolean> {
+  const truncatedMessage = message.length > 50 ? message.substring(0, 50) + '...' : message;
+  
+  return sendNotification({
+    userId,
+    type: 'chat_message',
+    title: `💬 ${senderName}`,
+    body: truncatedMessage,
+    data: { machineId, senderName },
+    sound: 'default',
+    priority: 'high',
+    channelId: 'chat',
+  });
+}
 
-  return { sent, notificationId };
+/**
+ * Notify incoming voice call
+ */
+export async function notifyIncomingVoiceCall(
+  userId: string, 
+  callerName: string,
+  callId: string
+): Promise<boolean> {
+  return sendNotification({
+    userId,
+    type: 'voice_call',
+    title: '📞 Incoming Call',
+    body: `${callerName} is calling you`,
+    data: { callId, callerName },
+    sound: 'alarm',
+    priority: 'high',
+    channelId: 'calls',
+  });
+}
+
+/**
+ * Notify incoming video call
+ */
+export async function notifyIncomingVideoCall(
+  userId: string, 
+  callerName: string,
+  callId: string
+): Promise<boolean> {
+  return sendNotification({
+    userId,
+    type: 'video_call',
+    title: '📹 Incoming Video Call',
+    body: `${callerName} is video calling you`,
+    data: { callId, callerName },
+    sound: 'alarm',
+    priority: 'high',
+    channelId: 'calls',
+  });
+}
+
+/**
+ * Notify missed call
+ */
+export async function notifyMissedCall(
+  userId: string, 
+  callerName: string,
+  isVideo: boolean = false
+): Promise<boolean> {
+  return sendNotification({
+    userId,
+    type: isVideo ? 'missed_video' : 'missed_call',
+    title: isVideo ? '📹 Missed Video Call' : '📞 Missed Call',
+    body: `You missed a ${isVideo ? 'video ' : ''}call from ${callerName}`,
+    data: { callerName },
+    sound: 'default',
+    priority: 'normal',
+  });
 }

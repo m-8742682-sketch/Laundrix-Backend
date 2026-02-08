@@ -3,10 +3,16 @@
  * 
  * Join the queue for a machine
  * 
- * Request body: { machineId: string, userId: string }
+ * Request body: { machineId: string, userId: string, userName: string }
+ * 
+ * OPTIMIZATIONS:
+ * - Parallel database reads where possible
+ * - Reduced sequential awaits
+ * - Faster response times
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { handleCors } from '../lib/cors';
 import { 
   getMachine,
   getUser,
@@ -15,17 +21,20 @@ import {
   updateNextUserId 
 } from '../lib/queue';
 import { sendAndStoreNotification } from '../lib/fcm';
-import type { ApiResponse } from '../lib/types';
 
 interface JoinQueueRequest {
   machineId: string;
   userId: string;
+  userName: string;
 }
 
 export default async function handler(
   req: VercelRequest,
   res: VercelResponse
 ): Promise<void> {
+  // Handle CORS
+  if (handleCors(req, res)) return;
+
   // Only allow POST
   if (req.method !== 'POST') {
     res.status(405).json({ success: false, error: 'Method not allowed' });
@@ -33,7 +42,7 @@ export default async function handler(
   }
 
   try {
-    const { machineId, userId } = req.body as JoinQueueRequest;
+    const { machineId, userId, userName } = req.body as JoinQueueRequest;
 
     // Validate input
     if (!machineId || !userId) {
@@ -44,8 +53,14 @@ export default async function handler(
       return;
     }
 
-    // Get machine data
-    const machine = await getMachine(machineId);
+    // OPTIMIZATION: Run machine and user checks in parallel
+    const [machine, user, userInQueue] = await Promise.all([
+      getMachine(machineId),
+      getUser(userId),
+      isUserInQueue(machineId, userId)
+    ]);
+
+    // Validate machine exists
     if (!machine) {
       res.status(404).json({ 
         success: false, 
@@ -54,8 +69,7 @@ export default async function handler(
       return;
     }
 
-    // Get user data
-    const user = await getUser(userId);
+    // Validate user exists
     if (!user) {
       res.status(404).json({ 
         success: false, 
@@ -65,7 +79,7 @@ export default async function handler(
     }
 
     // Check if already in queue
-    if (await isUserInQueue(machineId, userId)) {
+    if (userInQueue) {
       res.status(400).json({ 
         success: false, 
         error: 'Already in queue for this machine' 
@@ -86,7 +100,7 @@ export default async function handler(
     const queueUser = await addUserToQueue(
       machineId,
       userId,
-      user.displayName || user.name || 'Unknown',
+      userName || user.displayName || user.name || 'Unknown',
       user.photoURL || user.avatar || null
     );
 
@@ -98,20 +112,24 @@ export default async function handler(
       return;
     }
 
-    // Update nextUserId if this is first in queue
-    await updateNextUserId(machineId);
-
-    // Send confirmation notification
-    await sendAndStoreNotification({
-      userId,
-      type: 'session_started', // Reusing type, could create 'queue_joined'
-      title: '✅ Joined Queue',
-      body: `You are #${queueUser.position} in line for Machine ${machineId}.`,
-      data: { machineId, position: queueUser.position.toString() }
+    // OPTIMIZATION: Run notification and nextUserId update in parallel
+    // (don't wait for notification to send before responding)
+    Promise.all([
+      updateNextUserId(machineId),
+      sendAndStoreNotification({
+        userId,
+        type: 'queue_joined', // Use correct type from fcm.ts
+        title: '✅ Joined Queue',
+        body: `You are #${queueUser.position} in line for Machine ${machineId}.`,
+        data: { machineId, position: queueUser.position.toString() }
+      })
+    ]).catch(err => {
+      console.error('Background task error:', err);
     });
 
     console.log(`User ${userId} joined queue for ${machineId} at position ${queueUser.position}`);
 
+    // Send response immediately (don't wait for background tasks)
     res.status(200).json({
       success: true,
       message: `Joined queue at position ${queueUser.position}`,

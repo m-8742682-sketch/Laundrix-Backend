@@ -4,7 +4,6 @@
   "description": "Laundrix IoT QR Code Backend API",
   "private": true,
   "scripts": {
-    "dev": "vercel dev",
     "deploy": "vercel --prod",
     "lint": "eslint api/**/*.ts",
     "type-check": "tsc --noEmit"

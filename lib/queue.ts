@@ -27,6 +27,19 @@ export interface QueueDocument {
 }
 
 /**
+ * Check if a user exists in the users collection
+ */
+export async function userExists(userId: string): Promise<boolean> {
+  try {
+    const userDoc = await usersRef.doc(userId).get();
+    return userDoc.exists;
+  } catch (error) {
+    console.error(`Failed to check if user ${userId} exists:`, error);
+    return true; // Assume exists on error to avoid accidental deletion
+  }
+}
+
+/**
  * Get the next user in queue (earliest joinedAt, position 1)
  */
 export async function getNextUser(machineId: string): Promise<QueueUser | null> {
@@ -35,10 +48,11 @@ export async function getNextUser(machineId: string): Promise<QueueUser | null> 
     if (!queueDoc.exists) return null;
 
     const queueData = queueDoc.data() as QueueDocument;
-    if (!queueData.users || queueData.users.length === 0) return null;
+    const users = queueData.users ?? [];
+    if (users.length === 0) return null;
 
     // Sort by position (should already be sorted, but ensure)
-    const sortedUsers = [...queueData.users].sort((a, b) => a.position - b.position);
+    const sortedUsers = [...users].sort((a, b) => a.position - b.position);
     return sortedUsers[0] || null;
   } catch (error) {
     console.error(`Failed to get next user for ${machineId}:`, error);
@@ -80,12 +94,13 @@ export async function removeUserFromQueue(machineId: string, userId: string): Pr
     if (!queueDoc.exists) return false;
 
     const queueData = queueDoc.data() as QueueDocument;
-    const userIndex = queueData.users?.findIndex(u => u.userId === userId);
+    const users = queueData.users ?? [];
+    const userIndex = users.findIndex(u => u.userId === userId);
     
-    if (userIndex === undefined || userIndex === -1) return false;
+    if (userIndex === -1) return false;
 
     // Remove user and reorder positions
-    const updatedUsers = queueData.users
+    const updatedUsers = users
       .filter(u => u.userId !== userId)
       .map((user, index) => ({
         ...user,
@@ -106,7 +121,7 @@ export async function removeUserFromQueue(machineId: string, userId: string): Pr
 }
 
 /**
- * Add user to queue
+ * Add user to queue (with validation that user exists)
  */
 export async function addUserToQueue(
   machineId: string, 
@@ -115,6 +130,13 @@ export async function addUserToQueue(
   avatar: string | null
 ): Promise<QueueUser | null> {
   try {
+    // Validate user exists before adding to queue
+    const exists = await userExists(userId);
+    if (!exists) {
+      console.warn(`Cannot add user ${userId} to queue - user does not exist`);
+      return null;
+    }
+
     const queueDoc = await queuesRef.doc(machineId).get();
     
     let users: QueueUser[] = [];
@@ -244,7 +266,10 @@ export async function updateUserActivity(machineId: string, userId: string): Pro
     if (!queueDoc.exists) return false;
 
     const queueData = queueDoc.data() as QueueDocument;
-    const updatedUsers = queueData.users.map(user => {
+    const users = queueData.users ?? [];
+    if (users.length === 0) return false;
+    
+    const updatedUsers = users.map(user => {
       if (user.userId === userId) {
         return { ...user, lastActiveAt: new Date().toISOString() };
       }
@@ -260,5 +285,91 @@ export async function updateUserActivity(machineId: string, userId: string): Pro
   } catch (error) {
     console.error(`Failed to update user activity:`, error);
     return false;
+  }
+}
+
+/**
+ * Remove deleted user from all queues
+ */
+export async function cleanupDeletedUser(userId: string): Promise<void> {
+  try {
+    const queuesSnapshot = await queuesRef.get();
+    
+    const updates: Promise<any>[] = [];
+    
+    for (const queueDoc of queuesSnapshot.docs) {
+      const queueData = queueDoc.data() as QueueDocument;
+      const users = queueData.users ?? [];
+      const hasUser = users.some(u => u.userId === userId);
+      
+      if (hasUser) {
+        updates.push(removeUserFromQueue(queueDoc.id, userId));
+      }
+    }
+    
+    await Promise.all(updates);
+    console.log(`Cleaned up deleted user ${userId} from all queues`);
+  } catch (error) {
+    console.error(`Failed to cleanup user ${userId}:`, error);
+  }
+}
+
+/**
+ * Clean all queues by removing users that no longer exist
+ * Returns list of removed user IDs
+ */
+export async function cleanupAllQueues(): Promise<{ queueId: string; removedUsers: string[] }[]> {
+  const results: { queueId: string; removedUsers: string[] }[] = [];
+
+  try {
+    const queuesSnapshot = await queuesRef.get();
+
+    for (const queueDoc of queuesSnapshot.docs) {
+      const queueData = queueDoc.data() as QueueDocument;
+      const users = queueData.users ?? [];
+      
+      if (users.length === 0) continue;
+
+      const removedUsers: string[] = [];
+      const validUsers: QueueUser[] = [];
+
+      // Check each user
+      for (const queueUser of users) {
+        const exists = await userExists(queueUser.userId);
+        
+        if (exists) {
+          validUsers.push(queueUser);
+        } else {
+          removedUsers.push(queueUser.userId);
+          console.log(`User ${queueUser.userId} no longer exists, removing from queue ${queueDoc.id}`);
+        }
+      }
+
+      // Update queue if any users were removed
+      if (removedUsers.length > 0) {
+        const reorderedUsers = validUsers.map((user, index) => ({
+          ...user,
+          position: index + 1,
+        }));
+
+        await queuesRef.doc(queueDoc.id).update({
+          users: reorderedUsers,
+          lastUpdated: new Date().toISOString(),
+        });
+
+        // Update nextUserId for this machine
+        await updateNextUserId(queueDoc.id);
+
+        results.push({
+          queueId: queueDoc.id,
+          removedUsers,
+        });
+      }
+    }
+
+    return results;
+  } catch (error) {
+    console.error('Failed to cleanup all queues:', error);
+    return results;
   }
 }

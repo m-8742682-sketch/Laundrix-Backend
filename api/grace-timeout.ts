@@ -11,6 +11,7 @@
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { handleCors } from '../lib/cors';
 import { rtdb } from '../lib/firebase';
 import { 
   getMachine,
@@ -30,6 +31,9 @@ export default async function handler(
   req: VercelRequest,
   res: VercelResponse
 ): Promise<void> {
+  // Handle CORS
+  if (handleCors(req, res)) return;
+
   // Only allow POST
   if (req.method !== 'POST') {
     res.status(405).json({ success: false, error: 'Method not allowed' });
