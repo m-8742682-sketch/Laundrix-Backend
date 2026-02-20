@@ -1,0 +1,21 @@
+name: Cron Jobs
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Every 5 minutes (minimum for GitHub)
+  workflow_dispatch:
+
+jobs:
+  grace-timeout:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Grace Timeout
+        run: |
+          curl -X GET "https://laundrix-backend.vercel.app/api/cron-grace-timeout?secret=${{ secrets.CRON_SECRET_KEY }}"
+  
+  incident-timeout:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Incident Timeout
+        run: |
+          curl -X GET "https://laundrix-backend.vercel.app/api/cron-incident-timeout?secret=${{ secrets.CRON_SECRET_KEY }}"

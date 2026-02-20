@@ -1,375 +1,381 @@
 /**
  * Queue Management Helper
- * 
- * Handles queue operations: get next user, remove user, update positions
+ *
+ * KEY FIXES vs original:
+ * - removeUserFromQueue: atomic batch write (queue + machine.nextUserId together)
+ * - addUserToQueue: Firestore transaction (race-safe, idempotency key support)
+ * - setCurrentUser: batch write for status + nextUserId
  */
 
-import { queuesRef, machinesRef, usersRef } from './firebase';
-import { FieldValue } from 'firebase-admin/firestore';
+import { queuesRef, machinesRef, usersRef, db } from "./firebase";
+import { FieldValue } from "firebase-admin/firestore";
 
-// Queue user structure
+// ─── Types ────────────────────────────────────────────────────────────────────
+
 export interface QueueUser {
-  position: number;
-  userId: string;
-  name: string;
-  avatar: string | null;
-  queueToken: string;
-  joinedAt: string;
+  position:     number;
+  userId:       string;
+  name:         string;
+  avatar:       string | null;
+  queueToken:   string;
+  joinedAt:     string;
   lastActiveAt?: string;
 }
 
-// Queue document structure
 export interface QueueDocument {
-  machineId: string;
-  status: 'Active' | 'Paused' | 'Closed';
+  machineId:   string;
+  status:      "Active" | "Paused" | "Closed";
   lastUpdated: string;
-  users: QueueUser[];
+  users:       QueueUser[];
 }
 
-/**
- * Check if a user exists in the users collection
- */
+// ─── User existence check ────────────────────────────────────────────────────
+
 export async function userExists(userId: string): Promise<boolean> {
   try {
     const userDoc = await usersRef.doc(userId).get();
     return userDoc.exists;
-  } catch (error) {
-    console.error(`Failed to check if user ${userId} exists:`, error);
-    return true; // Assume exists on error to avoid accidental deletion
+  } catch {
+    return true; // assume exists on error to avoid accidental deletion
   }
 }
 
-/**
- * Get the next user in queue (earliest joinedAt, position 1)
- */
+// ─── Get next user in queue ──────────────────────────────────────────────────
+
 export async function getNextUser(machineId: string): Promise<QueueUser | null> {
   try {
-    const queueDoc = await queuesRef.doc(machineId).get();
-    if (!queueDoc.exists) return null;
+    const snap = await queuesRef.doc(machineId).get();
+    if (!snap.exists) return null;
 
-    const queueData = queueDoc.data() as QueueDocument;
-    const users = queueData.users ?? [];
+    const users: QueueUser[] = (snap.data() as QueueDocument).users ?? [];
     if (users.length === 0) return null;
 
-    // Sort by position (should already be sorted, but ensure)
-    const sortedUsers = [...users].sort((a, b) => a.position - b.position);
-    return sortedUsers[0] || null;
-  } catch (error) {
-    console.error(`Failed to get next user for ${machineId}:`, error);
+    return [...users].sort((a, b) => a.position - b.position)[0];
+  } catch (err) {
+    console.error(`getNextUser failed for ${machineId}:`, err);
     return null;
   }
 }
 
-/**
- * Get user's position in queue
- */
-export async function getUserPosition(machineId: string, userId: string): Promise<number | null> {
-  try {
-    const queueDoc = await queuesRef.doc(machineId).get();
-    if (!queueDoc.exists) return null;
+// ─── Position lookup ─────────────────────────────────────────────────────────
 
-    const queueData = queueDoc.data() as QueueDocument;
-    const user = queueData.users?.find(u => u.userId === userId);
-    return user?.position || null;
-  } catch (error) {
-    console.error(`Failed to get user position:`, error);
+export async function getUserPosition(
+  machineId: string,
+  userId: string
+): Promise<number | null> {
+  try {
+    const snap = await queuesRef.doc(machineId).get();
+    if (!snap.exists) return null;
+
+    const user = (snap.data() as QueueDocument).users?.find(
+      (u) => u.userId === userId
+    );
+    return user?.position ?? null;
+  } catch {
     return null;
   }
 }
 
-/**
- * Check if user is in queue
- */
-export async function isUserInQueue(machineId: string, userId: string): Promise<boolean> {
-  const position = await getUserPosition(machineId, userId);
-  return position !== null;
+export async function isUserInQueue(
+  machineId: string,
+  userId: string
+): Promise<boolean> {
+  return (await getUserPosition(machineId, userId)) !== null;
 }
 
-/**
- * Remove user from queue and reorder positions
- */
-export async function removeUserFromQueue(machineId: string, userId: string): Promise<boolean> {
+// ─── REMOVE user — ATOMIC BATCH ──────────────────────────────────────────────
+//
+// Previous code: two separate awaits → nextUserId could go stale if network
+// drops between them.  Now both writes commit together or neither does.
+
+export async function removeUserFromQueue(
+  machineId: string,
+  userId: string
+): Promise<boolean> {
   try {
-    const queueDoc = await queuesRef.doc(machineId).get();
-    if (!queueDoc.exists) return false;
+    const snap = await queuesRef.doc(machineId).get();
+    if (!snap.exists) return false;
 
-    const queueData = queueDoc.data() as QueueDocument;
-    const users = queueData.users ?? [];
-    const userIndex = users.findIndex(u => u.userId === userId);
-    
-    if (userIndex === -1) return false;
+    const users: QueueUser[] = (snap.data() as QueueDocument).users ?? [];
+    if (!users.some((u) => u.userId === userId)) return false;
 
-    // Remove user and reorder positions
     const updatedUsers = users
-      .filter(u => u.userId !== userId)
-      .map((user, index) => ({
-        ...user,
-        position: index + 1,
-      }));
+      .filter((u) => u.userId !== userId)
+      .map((u, i) => ({ ...u, position: i + 1 }));
 
-    await queuesRef.doc(machineId).update({
-      users: updatedUsers,
+    const newNextUserId = updatedUsers[0]?.userId ?? null;
+
+    // ATOMIC: both queue and machine update together
+    const batch = db.batch();
+
+    batch.update(queuesRef.doc(machineId), {
+      users:       updatedUsers,
       lastUpdated: new Date().toISOString(),
     });
 
-    console.log(`Removed user ${userId} from queue ${machineId}`);
+    batch.update(machinesRef.doc(machineId), {
+      nextUserId:  newNextUserId,
+      lastUpdated: FieldValue.serverTimestamp(),
+    });
+
+    await batch.commit();
+
+    console.log(`Removed ${userId} from queue ${machineId}`);
     return true;
-  } catch (error) {
-    console.error(`Failed to remove user from queue:`, error);
+  } catch (err) {
+    console.error(`removeUserFromQueue failed:`, err);
     return false;
   }
 }
 
-/**
- * Add user to queue (with validation that user exists)
- */
+// ─── ADD user — TRANSACTION (race-safe + idempotency key) ────────────────────
+//
+// Previous code: read → check → write in separate steps → two concurrent
+// requests could both pass the "already in queue?" check before either wrote.
+// Now the check AND write happen inside a single Firestore transaction.
+
 export async function addUserToQueue(
-  machineId: string, 
-  userId: string, 
-  name: string, 
-  avatar: string | null
+  machineId:       string,
+  userId:          string,
+  name:            string,
+  avatar:          string | null,
+  idempotencyKey?: string       // generated by client, prevents double-join
 ): Promise<QueueUser | null> {
   try {
-    // Validate user exists before adding to queue
     const exists = await userExists(userId);
     if (!exists) {
-      console.warn(`Cannot add user ${userId} to queue - user does not exist`);
+      console.warn(`Cannot add ${userId} — user does not exist`);
       return null;
     }
 
-    const queueDoc = await queuesRef.doc(machineId).get();
-    
-    let users: QueueUser[] = [];
-    if (queueDoc.exists) {
-      const queueData = queueDoc.data() as QueueDocument;
-      users = queueData.users || [];
-      
-      // Check if already in queue
-      if (users.some(u => u.userId === userId)) {
-        console.log(`User ${userId} already in queue`);
-        return users.find(u => u.userId === userId) || null;
+    const result = await db.runTransaction(
+      async (tx: FirebaseFirestore.Transaction) => {
+        const snap = await tx.get(queuesRef.doc(machineId));
+
+        let users: QueueUser[] = [];
+
+        if (snap.exists) {
+          users = (snap.data() as QueueDocument).users ?? [];
+
+          // Already in queue?
+          const existing = users.find((u) => u.userId === userId);
+          if (existing) return existing;
+
+          // Duplicate via idempotency key?
+          if (idempotencyKey) {
+            const dup = users.find((u) => u.queueToken === idempotencyKey);
+            if (dup) return dup;
+          }
+        }
+
+        const newUser: QueueUser = {
+          position:     users.length + 1,
+          userId,
+          name,
+          avatar,
+          queueToken:   idempotencyKey ??
+            `q_${Date.now()}${Math.random().toString(36).substring(2, 7)}`,
+          joinedAt:     new Date().toISOString(),
+          lastActiveAt: new Date().toISOString(),
+        };
+
+        const updatedUsers = [...users, newUser];
+
+        tx.set(
+          queuesRef.doc(machineId),
+          {
+            machineId,
+            status:      "Active",
+            lastUpdated: new Date().toISOString(),
+            users:       updatedUsers,
+          },
+          { merge: true }
+        );
+
+        // Only update nextUserId if this is the first person in queue
+        if (users.length === 0) {
+          tx.update(machinesRef.doc(machineId), {
+            nextUserId:  userId,
+            lastUpdated: FieldValue.serverTimestamp(),
+          });
+        }
+
+        return newUser;
       }
-    }
+    );
 
-    const newUser: QueueUser = {
-      position: users.length + 1,
-      userId,
-      name,
-      avatar,
-      queueToken: `q_${Date.now()}${Math.random().toString(36).substring(2, 7)}`,
-      joinedAt: new Date().toISOString(),
-      lastActiveAt: new Date().toISOString(),
-    };
-
-    users.push(newUser);
-
-    await queuesRef.doc(machineId).set({
-      machineId,
-      status: 'Active',
-      lastUpdated: new Date().toISOString(),
-      users,
-    }, { merge: true });
-
-    console.log(`Added user ${userId} to queue ${machineId} at position ${newUser.position}`);
-    return newUser;
-  } catch (error) {
-    console.error(`Failed to add user to queue:`, error);
+    console.log(`Added ${userId} to queue ${machineId} at position ${result.position}`);
+    return result;
+  } catch (err) {
+    console.error(`addUserToQueue failed:`, err);
     return null;
   }
 }
 
-/**
- * Update nextUserId in machine document
- */
+// ─── Update nextUserId ────────────────────────────────────────────────────────
+//
+// Kept for cases where a direct update is still needed (e.g., after cron
+// cleanup).  For normal join/leave, the atomic batch handles this.
+
 export async function updateNextUserId(machineId: string): Promise<string | null> {
   try {
-    const nextUser = await getNextUser(machineId);
-    const nextUserId = nextUser?.userId || null;
+    const nextUser     = await getNextUser(machineId);
+    const nextUserId   = nextUser?.userId ?? null;
 
     await machinesRef.doc(machineId).update({
       nextUserId,
       lastUpdated: FieldValue.serverTimestamp(),
     });
 
-    console.log(`Updated nextUserId for ${machineId}: ${nextUserId}`);
     return nextUserId;
-  } catch (error) {
-    console.error(`Failed to update nextUserId:`, error);
+  } catch (err) {
+    console.error(`updateNextUserId failed:`, err);
     return null;
   }
 }
 
-/**
- * Set current user and update nextUserId
- */
-export async function setCurrentUser(machineId: string, userId: string | null): Promise<boolean> {
+// ─── Set current user — BATCH ─────────────────────────────────────────────────
+
+export async function setCurrentUser(
+  machineId: string,
+  userId:    string | null
+): Promise<boolean> {
   try {
-    const updateData: Record<string, any> = {
+    const nextUser   = await getNextUser(machineId);
+    const nextUserId = nextUser?.userId ?? null;
+
+    const batch = db.batch();
+
+    batch.update(machinesRef.doc(machineId), {
       currentUserId: userId,
-      lastUpdated: FieldValue.serverTimestamp(),
-    };
+      status:        userId ? "In Use" : "Available",
+      nextUserId,
+      lastUpdated:   FieldValue.serverTimestamp(),
+    });
 
-    // If setting a user, update status
-    if (userId) {
-      updateData.status = 'In Use';
-    } else {
-      updateData.status = 'Available';
-    }
+    await batch.commit();
 
-    await machinesRef.doc(machineId).update(updateData);
-
-    // Update nextUserId after changing currentUser
-    await updateNextUserId(machineId);
-
-    console.log(`Set currentUserId for ${machineId}: ${userId}`);
+    console.log(`setCurrentUser ${machineId}: ${userId}`);
     return true;
-  } catch (error) {
-    console.error(`Failed to set current user:`, error);
+  } catch (err) {
+    console.error(`setCurrentUser failed:`, err);
     return false;
   }
 }
 
-/**
- * Get machine document
- */
-export async function getMachine(machineId: string): Promise<Record<string, any> | null> {
+// ─── Simple helpers ───────────────────────────────────────────────────────────
+
+export async function getMachine(
+  machineId: string
+): Promise<Record<string, any> | null> {
   try {
-    const machineDoc = await machinesRef.doc(machineId).get();
-    if (!machineDoc.exists) return null;
-    return machineDoc.data() || null;
-  } catch (error) {
-    console.error(`Failed to get machine ${machineId}:`, error);
+    const snap = await machinesRef.doc(machineId).get();
+    return snap.exists ? snap.data() ?? null : null;
+  } catch {
     return null;
   }
 }
 
-/**
- * Get user details
- */
-export async function getUser(userId: string): Promise<Record<string, any> | null> {
+export async function getUser(
+  userId: string
+): Promise<Record<string, any> | null> {
   try {
-    const userDoc = await usersRef.doc(userId).get();
-    if (!userDoc.exists) return null;
-    return { id: userDoc.id, ...userDoc.data() };
-  } catch (error) {
-    console.error(`Failed to get user ${userId}:`, error);
+    const snap = await usersRef.doc(userId).get();
+    return snap.exists ? { id: snap.id, ...snap.data() } : null;
+  } catch {
     return null;
   }
 }
 
-/**
- * Update user's lastActiveAt in queue
- */
-export async function updateUserActivity(machineId: string, userId: string): Promise<boolean> {
+export async function updateUserActivity(
+  machineId: string,
+  userId:    string
+): Promise<boolean> {
   try {
-    const queueDoc = await queuesRef.doc(machineId).get();
-    if (!queueDoc.exists) return false;
+    const snap = await queuesRef.doc(machineId).get();
+    if (!snap.exists) return false;
 
-    const queueData = queueDoc.data() as QueueDocument;
-    const users = queueData.users ?? [];
-    if (users.length === 0) return false;
-    
-    const updatedUsers = users.map(user => {
-      if (user.userId === userId) {
-        return { ...user, lastActiveAt: new Date().toISOString() };
-      }
-      return user;
-    });
+    const users: QueueUser[] = (snap.data() as QueueDocument).users ?? [];
+    const updatedUsers = users.map((u) =>
+      u.userId === userId
+        ? { ...u, lastActiveAt: new Date().toISOString() }
+        : u
+    );
 
     await queuesRef.doc(machineId).update({
-      users: updatedUsers,
+      users:       updatedUsers,
       lastUpdated: new Date().toISOString(),
     });
-
     return true;
-  } catch (error) {
-    console.error(`Failed to update user activity:`, error);
+  } catch {
     return false;
   }
 }
 
-/**
- * Remove deleted user from all queues
- */
+// ─── Cleanup deleted user from all queues ─────────────────────────────────────
+
 export async function cleanupDeletedUser(userId: string): Promise<void> {
   try {
-    const queuesSnapshot = await queuesRef.get();
-    
-    const updates: Promise<any>[] = [];
-    
-    for (const queueDoc of queuesSnapshot.docs) {
-      const queueData = queueDoc.data() as QueueDocument;
-      const users = queueData.users ?? [];
-      const hasUser = users.some(u => u.userId === userId);
-      
-      if (hasUser) {
-        updates.push(removeUserFromQueue(queueDoc.id, userId));
-      }
-    }
-    
+    const snap    = await queuesRef.get();
+    const updates = snap.docs
+      .filter((d) =>
+        ((d.data() as QueueDocument).users ?? []).some(
+          (u) => u.userId === userId
+        )
+      )
+      .map((d) => removeUserFromQueue(d.id, userId));
+
     await Promise.all(updates);
-    console.log(`Cleaned up deleted user ${userId} from all queues`);
-  } catch (error) {
-    console.error(`Failed to cleanup user ${userId}:`, error);
+    console.log(`Cleaned up deleted user ${userId}`);
+  } catch (err) {
+    console.error(`cleanupDeletedUser failed:`, err);
   }
 }
 
-/**
- * Clean all queues by removing users that no longer exist
- * Returns list of removed user IDs
- */
-export async function cleanupAllQueues(): Promise<{ queueId: string; removedUsers: string[] }[]> {
+// ─── Cleanup all queues (remove ghost users) ──────────────────────────────────
+
+export async function cleanupAllQueues(): Promise<
+  { queueId: string; removedUsers: string[] }[]
+> {
   const results: { queueId: string; removedUsers: string[] }[] = [];
 
   try {
-    const queuesSnapshot = await queuesRef.get();
+    const snap = await queuesRef.get();
 
-    for (const queueDoc of queuesSnapshot.docs) {
-      const queueData = queueDoc.data() as QueueDocument;
-      const users = queueData.users ?? [];
-      
+    for (const queueDoc of snap.docs) {
+      const users: QueueUser[] =
+        (queueDoc.data() as QueueDocument).users ?? [];
       if (users.length === 0) continue;
 
       const removedUsers: string[] = [];
-      const validUsers: QueueUser[] = [];
+      const validUsers:   QueueUser[] = [];
 
-      // Check each user
-      for (const queueUser of users) {
-        const exists = await userExists(queueUser.userId);
-        
-        if (exists) {
-          validUsers.push(queueUser);
+      for (const u of users) {
+        if (await userExists(u.userId)) {
+          validUsers.push(u);
         } else {
-          removedUsers.push(queueUser.userId);
-          console.log(`User ${queueUser.userId} no longer exists, removing from queue ${queueDoc.id}`);
+          removedUsers.push(u.userId);
         }
       }
 
-      // Update queue if any users were removed
       if (removedUsers.length > 0) {
-        const reorderedUsers = validUsers.map((user, index) => ({
-          ...user,
-          position: index + 1,
+        const reordered = validUsers.map((u, i) => ({
+          ...u,
+          position: i + 1,
         }));
 
         await queuesRef.doc(queueDoc.id).update({
-          users: reorderedUsers,
+          users:       reordered,
           lastUpdated: new Date().toISOString(),
         });
-
-        // Update nextUserId for this machine
         await updateNextUserId(queueDoc.id);
 
-        results.push({
-          queueId: queueDoc.id,
-          removedUsers,
-        });
+        results.push({ queueId: queueDoc.id, removedUsers });
       }
     }
-
-    return results;
-  } catch (error) {
-    console.error('Failed to cleanup all queues:', error);
-    return results;
+  } catch (err) {
+    console.error("cleanupAllQueues failed:", err);
   }
+
+  return results;
 }
