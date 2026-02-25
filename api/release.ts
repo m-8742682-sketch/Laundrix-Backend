@@ -1,31 +1,26 @@
 /**
- * POST /api/release
- * 
- * Release Machine Handler - End current user's session
- * 
- * Request body: { machineId: string, userId: string }
- * 
- * Logic:
- * 1. Verify user is currentUserId
- * 2. Clear currentUserId
- * 3. Unlock door (stays unlocked for next user)
- * 4. Notify nextUserId (starts 5-min grace period)
- * 5. Update machine status to Available
+ * POST /api/release  — FIXED VERSION
+ *
+ * Fixes:
+ *  #7  Write usage record to Firestore usageHistory when session ends
+ *      - reads startTime from RTDB sessions/{machineId}
+ *      - calculates duration
+ *      - stores {userId, machineId, startTime, endTime, duration, resultStatus}
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { handleCors } from '../lib/cors';
-import { getCommandsRef, rtdb } from '../lib/firebase';
-import { 
-  getMachine, 
-  setCurrentUser, 
+import { getCommandsRef, rtdb, db, machinesRef } from '../lib/firebase';
+import {
+  getMachine,
+  setCurrentUser,
   getNextUser,
-  updateNextUserId 
+  updateNextUserId
 } from '../lib/queue';
-import { 
+import {
   notifyYourTurn,
   notifySessionEnded,
-  sendAndStoreNotification 
+  sendAndStoreNotification
 } from '../lib/fcm';
 import type { ReleaseRequest, ApiResponse, GracePeriod } from '../lib/types';
 
@@ -33,10 +28,7 @@ export default async function handler(
   req: VercelRequest,
   res: VercelResponse
 ): Promise<void> {
-  // Handle CORS
   if (handleCors(req, res)) return;
-
-  // Only allow POST
   if (req.method !== 'POST') {
     res.status(405).json({ success: false, error: 'Method not allowed' });
     return;
@@ -45,68 +37,95 @@ export default async function handler(
   try {
     const { machineId, userId } = req.body as ReleaseRequest;
 
-    // Validate input
     if (!machineId || !userId) {
-      res.status(400).json({ 
-        success: false, 
-        error: 'Missing machineId or userId' 
-      });
+      res.status(400).json({ success: false, error: 'Missing machineId or userId' });
       return;
     }
 
-    // Get machine data
     const machine = await getMachine(machineId);
     if (!machine) {
-      res.status(404).json({ 
-        success: false, 
-        error: 'Machine not found' 
-      });
+      res.status(404).json({ success: false, error: 'Machine not found' });
       return;
     }
-
-    // Verify user is current user
     if (machine.currentUserId !== userId) {
-      res.status(403).json({ 
-        success: false, 
-        error: 'You are not the current user of this machine' 
-      });
+      res.status(403).json({ success: false, error: 'You are not the current user of this machine' });
       return;
     }
 
-    // Clear current user
-    await setCurrentUser(machineId, null);
+    // ── FIX #7: Read session start time before clearing ───────────────────────
+    const endTime = new Date();
+    let startTime: Date | null = null;
+    let userName = 'Unknown';
 
-    // Unlock door (stays closed but unlocked)
-    await unlockDoor(machineId);
+    try {
+      const sessionSnap = await rtdb.ref(`sessions/${machineId}`).get();
+      const sessionData = sessionSnap.val();
+      if (sessionData?.startTime) {
+        startTime = new Date(sessionData.startTime);
+      }
+      // Get user name
+      const userSnap = await machinesRef.firestore.collection('users').doc(userId).get();
+      if (userSnap.exists) {
+        const userData = userSnap.data();
+        userName = userData?.displayName || userData?.name || 'Unknown';
+      }
+    } catch (err) {
+      console.warn('[release] Could not read session data:', err);
+    }
 
-    // Notify previous user (session ended)
+    // Clear current user and unlock door
+    await Promise.all([
+      setCurrentUser(machineId, null),
+      unlockDoor(machineId),
+    ]);
+
+    // ── FIX #7: Write usage record to Firestore ───────────────────────────────
+    if (startTime) {
+      const duration = Math.round((endTime.getTime() - startTime.getTime()) / 1000); // seconds
+      const usageRecord = {
+        userId,
+        userName,
+        machineId,
+        startTime: startTime.toISOString(),
+        endTime: endTime.toISOString(),
+        duration,
+        resultStatus: 'Normal' as const,
+        incidentId: null,
+        createdAt: endTime.toISOString(),
+      };
+
+      // Write to Firestore + clear RTDB session (fire-and-forget)
+      Promise.all([
+        db.collection('usageHistory').add(usageRecord),
+        rtdb.ref(`sessions/${machineId}`).remove(),
+      ]).catch(err => console.error('[release] usageHistory write failed:', err));
+    }
+
+    // Notify session ended
     await notifySessionEnded(userId, machineId);
-    await sendAndStoreNotification({
+    sendAndStoreNotification({
       userId,
       type: 'session_ended',
       title: '👋 Session Ended',
       body: `Your session at Machine ${machineId} has ended.`,
-      data: { machineId }
-    });
+      data: { machineId },
+    }).catch(() => {});
 
-    // Check if there's a next user
+    // Check for next user and start grace period
     const nextUser = await getNextUser(machineId);
-    
+
     if (nextUser) {
-      // Start grace period for next user
       await startGracePeriod(machineId, nextUser.userId);
-      
-      // Notify next user with alarm sound
-      await notifyYourTurn(nextUser.userId, machineId);
-      await sendAndStoreNotification({
+      notifyYourTurn(nextUser.userId, machineId).catch(() => {});
+      sendAndStoreNotification({
         userId: nextUser.userId,
         type: 'your_turn',
         title: '🎉 Your Turn!',
-        body: `Machine ${machineId} is ready for you. You have 5 minutes!`,
+        body: `Machine ${machineId} is ready! You have 5 minutes to scan in.`,
         data: { machineId },
         sound: 'alarm',
-        priority: 'high'
-      });
+        priority: 'high',
+      }).catch(() => {});
 
       res.status(200).json({
         success: true,
@@ -115,34 +134,23 @@ export default async function handler(
           released: true,
           nextUserId: nextUser.userId,
           nextUserName: nextUser.name,
-          gracePeriodMinutes: 5
-        }
+          gracePeriodMinutes: 5,
+        },
       });
     } else {
-      // No one in queue
       res.status(200).json({
         success: true,
         message: 'Session ended. Machine is now available.',
-        data: {
-          released: true,
-          nextUserId: null,
-          status: 'Available'
-        }
+        data: { released: true, nextUserId: null, status: 'Available' },
       });
     }
 
   } catch (error) {
     console.error('Release error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Internal server error' 
-    });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
 
-/**
- * Send unlock command to ESP32 via RTDB
- */
 async function unlockDoor(machineId: string): Promise<void> {
   const commandsRef = getCommandsRef(machineId);
   await commandsRef.update({
@@ -150,17 +158,12 @@ async function unlockDoor(machineId: string): Promise<void> {
     release: true,
     unlockAt: new Date().toISOString(),
   });
-  console.log(`Release + unlock command sent for ${machineId}`);
 }
 
-/**
- * Start grace period tracking in RTDB
- * The app will manage the countdown and call grace-timeout endpoint
- */
 async function startGracePeriod(machineId: string, userId: string): Promise<void> {
   const now = new Date();
-  const warningAt = new Date(now.getTime() + 2 * 60 * 1000);   // +2 minutes
-  const expiresAt = new Date(now.getTime() + 5 * 60 * 1000);   // +5 minutes
+  const warningAt = new Date(now.getTime() + 2 * 60 * 1000);
+  const expiresAt = new Date(now.getTime() + 5 * 60 * 1000); // 5 minutes
 
   const gracePeriod: GracePeriod = {
     machineId,
@@ -172,7 +175,6 @@ async function startGracePeriod(machineId: string, userId: string): Promise<void
     status: 'active',
   };
 
-  // Store in RTDB for real-time tracking
   await rtdb.ref(`gracePeriods/${machineId}`).set(gracePeriod);
-  console.log(`Started grace period for ${userId} on ${machineId}`);
+  console.log(`[release] Grace period started for ${userId} on ${machineId} — expires in 5 min`);
 }

@@ -12,31 +12,36 @@ export interface ApiResponse<T = any> {
 
 // Scan result types
 export type ScanResult = 
-  | 'authorized'           // User is currentUserId or nextUserId
-  | 'unauthorized'         // User is not authorized
-  | 'queue_empty_claim'    // Queue is empty, user can claim
-  | 'already_current'      // User is already currentUserId
-  | 'machine_not_found'    // Machine doesn't exist
-  | 'user_not_found';      // User doesn't exist
+  | 'authorized'
+  | 'unauthorized'
+  | 'queue_empty_claim'
+  | 'already_current'
+  | 'machine_not_found'
+  | 'user_not_found';
 
 // Incident status
 export type IncidentStatus = 
-  | 'pending'      // Waiting for nextUserId response
-  | 'confirmed'    // nextUserId confirmed "not me"
-  | 'timeout'      // 60s passed, no response
-  | 'dismissed';   // nextUserId said "that's me" (false alarm)
+  | 'pending'
+  | 'confirmed'
+  | 'timeout'
+  | 'dismissed';
 
-// Incident document
+// Incident document — FIX #6: currentUserId field added (the real owner)
 export interface Incident {
   id?: string;
   machineId: string;
   intruderId: string;
   intruderName: string;
+  // ownerUserId = whoever is the rightful owner (currentUserId if machine in use,
+  //               nextUserId if machine free and someone else is next)
+  ownerUserId: string;
+  ownerUserName: string;
+  // Keep legacy fields for backward compat
   nextUserId: string;
   nextUserName: string;
   status: IncidentStatus;
   createdAt: string;
-  expiresAt: string;        // createdAt + 60 seconds
+  expiresAt: string;
   resolvedAt: string | null;
   buzzerTriggered: boolean;
 }
@@ -52,6 +57,19 @@ export interface GracePeriod {
   status: 'active' | 'claimed' | 'expired';
 }
 
+// Usage record — FIX #7: stored in Firestore usageHistory
+export interface UsageRecord {
+  id?: string;
+  userId: string;
+  userName: string;
+  machineId: string;
+  startTime: string;        // ISO string
+  endTime: string;          // ISO string
+  duration: number;         // seconds
+  resultStatus: 'Normal' | 'Unauthorized' | 'Interrupted';
+  incidentId?: string | null;
+}
+
 // Machine states
 export type MachineState = 
   | 'Available'
@@ -61,30 +79,37 @@ export type MachineState =
 
 // RTDB commands structure
 export interface MachineCommands {
-  unlock?: boolean;
-  release?: boolean;
+  solenoidOpen?: {
+    value: boolean;
+    triggeredAt: string;
+    triggeredBy: string;
+    expiresAt: string;
+    requestUserId?: string;
+  };
   buzzer?: boolean;
   dismissAlarm?: boolean;
   tare?: boolean;
-  requestUserId?: string;
 }
 
 // Scan request body
 export interface ScanRequest {
   machineId: string;
   userId: string;
+  userName?: string;
 }
 
 // Release request body
 export interface ReleaseRequest {
   machineId: string;
   userId: string;
+  userName?: string;
 }
 
 // Incident action request body
 export interface IncidentActionRequest {
   incidentId: string;
   userId: string;
+  userName?: string;
   action: 'confirm_not_me' | 'dismiss' | 'timeout';
 }
 
@@ -92,5 +117,24 @@ export interface IncidentActionRequest {
 export interface GraceTimeoutRequest {
   machineId: string;
   userId: string;
+  userName?: string;
   timeoutType: 'warning' | 'expired';
+}
+
+// API response for scan endpoint
+export interface ScanResponse {
+  success: boolean;
+  result: ScanResult;
+  message: string;
+  data?: {
+    unlocked?: boolean;
+    incidentId?: string;
+    currentUserId?: string | null;
+    nextUserId?: string | null;
+    expiresIn?: number;
+    expiresAt?: string;
+    nextUserName?: string;
+    ownerUserName?: string;
+  };
+  error?: string;
 }
