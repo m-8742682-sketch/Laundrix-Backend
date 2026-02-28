@@ -58,13 +58,15 @@ export default async function handler(
     let userName = 'Unknown';
 
     try {
-      const sessionSnap = await rtdb.ref(`sessions/${machineId}`).get();
+      // Parallel: fetch session data + user data simultaneously
+      const [sessionSnap, userSnap] = await Promise.all([
+        rtdb.ref(`sessions/${machineId}`).get(),
+        machinesRef.firestore.collection('users').doc(userId).get(),
+      ]);
       const sessionData = sessionSnap.val();
       if (sessionData?.startTime) {
         startTime = new Date(sessionData.startTime);
       }
-      // Get user name
-      const userSnap = await machinesRef.firestore.collection('users').doc(userId).get();
       if (userSnap.exists) {
         const userData = userSnap.data();
         userName = userData?.displayName || userData?.name || 'Unknown';
@@ -73,10 +75,12 @@ export default async function handler(
       console.warn('[release] Could not read session data:', err);
     }
 
-    // Clear current user and unlock door
+    // Clear current user, unlock door, and update RTDB iot/ immediately
     await Promise.all([
       setCurrentUser(machineId, null),
       unlockDoor(machineId),
+      // Clear currentUserId from RTDB iot/ so dashboard + queue update instantly
+      rtdb.ref(`iot/${machineId}`).update({ currentUserId: null, state: 'Available' }),
     ]);
 
     // ── FIX #7: Write usage record to Firestore ───────────────────────────────
@@ -115,7 +119,7 @@ export default async function handler(
     const nextUser = await getNextUser(machineId);
 
     if (nextUser) {
-      await startGracePeriod(machineId, nextUser.userId);
+      await startGracePeriod(machineId, nextUser.userId, nextUser.name || 'Unknown');
       notifyYourTurn(nextUser.userId, machineId).catch(() => {});
       sendAndStoreNotification({
         userId: nextUser.userId,
@@ -160,7 +164,7 @@ async function unlockDoor(machineId: string): Promise<void> {
   });
 }
 
-async function startGracePeriod(machineId: string, userId: string): Promise<void> {
+async function startGracePeriod(machineId: string, userId: string, userName: string): Promise<void> {
   const now = new Date();
   const warningAt = new Date(now.getTime() + 2 * 60 * 1000);
   const expiresAt = new Date(now.getTime() + 5 * 60 * 1000); // 5 minutes
@@ -168,6 +172,7 @@ async function startGracePeriod(machineId: string, userId: string): Promise<void
   const gracePeriod: GracePeriod = {
     machineId,
     userId,
+    userName,
     startedAt: now.toISOString(),
     warningAt: warningAt.toISOString(),
     expiresAt: expiresAt.toISOString(),

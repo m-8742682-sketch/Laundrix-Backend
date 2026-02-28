@@ -19,6 +19,8 @@ import {
   removeUserFromQueue,
 } from '../lib/queue';
 import { sendAndStoreNotification } from '../lib/fcm';
+import { rtdb } from '../lib/firebase';
+import type { GracePeriod } from '../lib/types';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -76,10 +78,17 @@ async function handleJoin(
   userName?: string,
   idempotencyKey?: string
 ): Promise<void> {
-  const [machine, user, userInQueue] = await Promise.all([
+  const { machinesRef: mRef, queuesRef: qRef } = await import('../lib/firebase').then(m => ({
+    machinesRef: m.machinesRef,
+    queuesRef: m.queuesRef,
+  }));
+
+  // All reads in parallel — machine, user, and queues fetched simultaneously
+  const [machine, user, allMachinesSnap, allQueuesSnap] = await Promise.all([
     getMachine(machineId),
     getUser(userId),
-    isUserInQueue(machineId, userId),
+    mRef.where('currentUserId', '==', userId).get(),
+    qRef.get(),
   ]);
 
   if (!machine) {
@@ -90,22 +99,45 @@ async function handleJoin(
     res.status(404).json({ success: false, error: 'User not found' });
     return;
   }
-  if (userInQueue) {
-    res.status(400).json({
-      success: false,
-      error: 'Already in queue for this machine',
-      code: 'ALREADY_IN_QUEUE',
-    });
-    return;
-  }
   if (machine.currentUserId === userId) {
+    res.status(400).json({ success: false, error: 'You are currently using this machine', code: 'ALREADY_CURRENT_USER' });
+    return;
+  }
+
+  // Check queues from the already-fetched allQueuesSnap (no extra reads needed)
+  const thisQueueDoc = allQueuesSnap.docs.find(d => d.id === machineId);
+  const thisQueueUsers: any[] = thisQueueDoc?.data()?.users ?? [];
+  const userInQueue = thisQueueUsers.some((u: any) => u.userId === userId);
+
+  if (userInQueue) {
+    res.status(400).json({ success: false, error: 'Already in queue for this machine', code: 'ALREADY_IN_QUEUE' });
+    return;
+  }
+
+  // ── One-machine-one-queue enforcement ─────────────────────────────────────
+  if (!allMachinesSnap.empty) {
+    const otherMachineId = allMachinesSnap.docs[0].id;
     res.status(400).json({
       success: false,
-      error: 'You are currently using this machine',
-      code: 'ALREADY_CURRENT_USER',
+      error: `You are already using Machine ${otherMachineId}. Please complete your current session first.`,
+      code: 'ALREADY_USING_MACHINE',
     });
     return;
   }
+  // Check if user is already in a queue for any OTHER machine (from already-fetched snap)
+  for (const qDoc of allQueuesSnap.docs) {
+    if (qDoc.id === machineId) continue;
+    const users: any[] = qDoc.data()?.users ?? [];
+    if (users.some((u: any) => u.userId === userId)) {
+      res.status(400).json({
+        success: false,
+        error: `You are already in the queue for Machine ${qDoc.id}. Leave that queue first.`,
+        code: 'ALREADY_IN_OTHER_QUEUE',
+      });
+      return;
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────────
 
   const queueUser = await addUserToQueue(
     machineId,
@@ -120,8 +152,12 @@ async function handleJoin(
     return;
   }
 
-  // Background: update nextUserId + send notification
-  Promise.all([
+  // Situation A: machine is free + user is now at position 1 → start grace immediately
+  const isMachineFree = !machine.currentUserId;
+  const isFirstInQueue = queueUser.position === 1;
+  const resolvedName = userName || (user as any).displayName || (user as any).name || 'Unknown';
+
+  const backgroundTasks: Promise<any>[] = [
     updateNextUserId(machineId),
     sendAndStoreNotification({
       userId,
@@ -130,9 +166,26 @@ async function handleJoin(
       body: `You are #${queueUser.position} in line for Machine ${machineId}.`,
       data: { machineId, position: queueUser.position.toString() },
     }),
-  ]).catch((err) => console.error('[queue/join] background error:', err));
+  ];
 
-  console.log(`User ${userId} joined queue for ${machineId} at position ${queueUser.position}`);
+  if (isMachineFree && isFirstInQueue) {
+    backgroundTasks.push(
+      startGracePeriodForUser(machineId, userId, resolvedName),
+      sendAndStoreNotification({
+        userId,
+        type: 'your_turn',
+        title: '🎉 Your Turn!',
+        body: `Machine ${machineId} is ready! You have 5 minutes to scan in.`,
+        data: { machineId },
+        sound: 'alarm',
+        priority: 'high',
+      })
+    );
+  }
+
+  Promise.all(backgroundTasks).catch((err) => console.error('[queue/join] background error:', err));
+
+    console.log(`User ${userId} joined queue for ${machineId} at position ${queueUser.position}`);
 
   res.status(200).json({
     success: true,
@@ -180,4 +233,26 @@ async function handleLeave(
   console.log(`User ${userId} left queue for ${machineId}`);
 
   res.status(200).json({ success: true, message: 'Successfully left the queue' });
+}
+
+// ─── Grace period helper (mirrors release.ts startGracePeriod) ────────────────
+
+async function startGracePeriodForUser(machineId: string, userId: string, userName: string): Promise<void> {
+  const now = new Date();
+  const warningAt = new Date(now.getTime() + 2 * 60 * 1000);
+  const expiresAt = new Date(now.getTime() + 5 * 60 * 1000);
+
+  const gracePeriod: GracePeriod = {
+    machineId,
+    userId,
+    userName,
+    startedAt: now.toISOString(),
+    warningAt: warningAt.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    warningSent: false,
+    status: 'active',
+  };
+
+  await rtdb.ref(`gracePeriods/${machineId}`).set(gracePeriod);
+  console.log(`[queue/join] Grace period started for ${userId} (${userName}) on ${machineId} (machine was free)`);
 }

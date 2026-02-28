@@ -265,12 +265,23 @@ export async function setCurrentUser(
 
 // ─── Simple helpers ───────────────────────────────────────────────────────────
 
+// ─── In-memory caches ────────────────────────────────────────────────────────
+const _machineCache = new Map<string, { data: any; ts: number }>();
+const _userCache = new Map<string, { data: any; ts: number }>();
+const CACHE_TTL = 4000;
+const USER_CACHE_TTL = 30000;
+
 export async function getMachine(
   machineId: string
 ): Promise<Record<string, any> | null> {
   try {
+    const now = Date.now();
+    const cached = _machineCache.get(machineId);
+    if (cached && now - cached.ts < CACHE_TTL) return cached.data;
     const snap = await machinesRef.doc(machineId).get();
-    return snap.exists ? snap.data() ?? null : null;
+    const data = snap.exists ? snap.data() ?? null : null;
+    _machineCache.set(machineId, { data, ts: now });
+    return data;
   } catch {
     return null;
   }
@@ -280,8 +291,13 @@ export async function getUser(
   userId: string
 ): Promise<Record<string, any> | null> {
   try {
+    const now = Date.now();
+    const cached = _userCache.get(userId);
+    if (cached && now - cached.ts < USER_CACHE_TTL) return cached.data;
     const snap = await usersRef.doc(userId).get();
-    return snap.exists ? { id: snap.id, ...snap.data() } : null;
+    const data = snap.exists ? { id: snap.id, ...snap.data() } : null;
+    _userCache.set(userId, { data, ts: now });
+    return data;
   } catch {
     return null;
   }

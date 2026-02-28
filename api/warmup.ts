@@ -3,12 +3,12 @@
  *
  * Lightweight endpoint called by the frontend at app launch to pre-warm
  * the Vercel serverless function and keep Firebase Admin initialized.
- * This eliminates the 4-7s cold-start penalty on first real API call.
+ * Also called every 5 minutes by Vercel cron to prevent cold starts.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { handleCors } from '../lib/cors';
-import { db } from '../lib/firebase'; // ensures Firebase Admin is initialized
+import { db, rtdb } from '../lib/firebase'; // ensures Firebase Admin is initialized
 
 export default async function handler(
   req: VercelRequest,
@@ -16,15 +16,14 @@ export default async function handler(
 ): Promise<void> {
   if (handleCors(req, res)) return;
 
-  // Minimal Firestore ping to keep connection alive
-  try {
-    await db.collection('_warmup').doc('ping').set(
+  // Warm up both Firestore and RTDB connections in parallel
+  await Promise.allSettled([
+    db.collection('_warmup').doc('ping').set(
       { ts: Date.now() },
       { merge: true }
-    );
-  } catch {
-    // Ignore - just warming the function
-  }
+    ),
+    rtdb.ref('_warmup').set({ ts: Date.now() }),
+  ]);
 
   res.status(200).json({
     status: 'warm',

@@ -50,6 +50,7 @@ export interface Incident {
 export interface GracePeriod {
   machineId: string;
   userId: string;
+  userName: string;         // stored so admin banner can display name without extra fetch
   startedAt: string;
   expiresAt: string;        // startedAt + 5 minutes
   warningAt: string;        // startedAt + 2 minutes

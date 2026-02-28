@@ -3,7 +3,8 @@
   "functions": {
     "api/**/*.ts": {
       "runtime": "@vercel/node@5.5.32",
-      "maxDuration": 10
+      "maxDuration": 10,
+      "memory": 1024
     }
   },
   "headers": [

@@ -19,7 +19,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
   }
 
   try {
-    const { incidentId, userId, action } = req.body as IncidentActionRequest;
+    const { incidentId, userId, action, cancelReason } = req.body as IncidentActionRequest & { cancelReason?: string };
     if (!incidentId || !userId || !action) {
       res.status(400).json({ success: false, error: 'Missing incidentId, userId, or action' });
       return;
@@ -44,7 +44,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
         break;
 
       case 'dismiss':
-        await handleDismiss(incidentId, incident, userId);
+        await handleDismiss(incidentId, incident, userId, cancelReason);
         res.status(200).json({ success: true, message: 'Incident dismissed.', data: { status: 'dismissed', buzzerTriggered: false } });
         break;
 
@@ -103,7 +103,7 @@ async function handleConfirmNotMe(incidentId: string, incident: Incident, userId
   ]);
 }
 
-async function handleDismiss(incidentId: string, incident: Incident, userId: string): Promise<void> {
+async function handleDismiss(incidentId: string, incident: Incident, userId: string, cancelReason?: string): Promise<void> {
   const ownerUserId = getOwnerUserId(incident);
   // FIX #6: allow the owner OR the intruder (if they tapped "That's Me") to dismiss
   if (userId !== ownerUserId && userId !== incident.intruderId) {
@@ -114,6 +114,7 @@ async function handleDismiss(incidentId: string, incident: Incident, userId: str
     status: 'dismissed',
     resolvedAt: new Date().toISOString(),
     buzzerTriggered: false,
+    ...(cancelReason ? { cancelReason } : {}),
   });
 }
 

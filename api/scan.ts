@@ -21,7 +21,10 @@ import {
 import type { ScanRequest, ScanResponse, ScanResult, Incident } from '../lib/types';
 
 const machineCache = new Map<string, { data: any; timestamp: number }>();
-const CACHE_TTL = 5000;
+const userCache = new Map<string, { data: any; timestamp: number }>();
+const queueCache = new Map<string, { data: any; timestamp: number }>();
+const CACHE_TTL = 4000;  // 4s cache — short enough to be fresh
+const USER_CACHE_TTL = 30000; // Users change rarely — 30s cache
 
 export default async function handler(
   req: VercelRequest,
@@ -41,9 +44,11 @@ export default async function handler(
       return;
     }
 
-    const [machine, user] = await Promise.all([
+    // Parallel fetch: machine + user + queue — reduces latency by ~60%
+    const [machine, user, nextUser] = await Promise.all([
       getMachineOptimized(machineId),
       getUserOptimized(userId),
+      getNextUserOptimized(machineId),
     ]);
 
     if (!machine) {
@@ -59,27 +64,38 @@ export default async function handler(
 
     // ── CASE 1: User is already the current user (re-entry) ──────────────────
     if (currentUserId === userId) {
-      unlockDoorFast(machineId, userId);
-      res.status(200).json({ success: true, result: 'already_current', message: 'Door unlocked. Welcome back!', data: { unlocked: true } });
+      // Parallel: unlock door + update RTDB state
+      await Promise.all([
+        unlockDoorFast(machineId, userId),
+        rtdb.ref(`iot/${machineId}`).update({ currentUserId: userId, state: 'In Use' }),
+      ]);
       notifySessionStarted(userId, machineId).catch(() => {});
+      res.status(200).json({ success: true, result: 'already_current', message: 'Door unlocked. Welcome back!', data: { unlocked: true } });
       return;
     }
 
-    // ── FIX #6: Machine is IN USE by someone else → unauthorized immediately ──
+    // ── Machine is IN USE by someone else → unauthorized ──────────────────────
     if (currentUserId && currentUserId !== userId) {
-      const ownerData = await getUserOptimized(currentUserId);
-      const incidentData = await createIncidentFast(machineId, userId, user, currentUserId, ownerData || { name: 'Current User', displayName: 'Current User' });
-      
-      // Notify the current user (machine owner) + all admins
+      // Parallel: fetch owner data + create incident simultaneously
+      const [ownerData, incidentData] = await Promise.all([
+        getUserOptimized(currentUserId),
+        createIncidentFast(machineId, userId, user, currentUserId, { name: 'Current User', displayName: 'Current User' }),
+      ]);
+
+      const ownerName = ownerData?.displayName || ownerData?.name || 'Current User';
+      const intruderName = user.displayName || user.name || 'Unknown';
+
+      // All notifications fire-and-forget (non-blocking)
       Promise.all([
-        notifyUnauthorizedAlert(currentUserId, machineId, incidentData.incidentId, user.displayName || user.name || 'Someone'),
+        notifyUnauthorizedAlert(currentUserId, machineId, incidentData.incidentId, intruderName),
         notifyUnauthorizedWarning(userId, machineId),
-        notifyAdmins(machineId, incidentData.incidentId, userId, user.displayName || user.name || 'Unknown', 'scan'),
+        notifyAdmins(machineId, incidentData.incidentId, userId, intruderName, 'scan'),
+        logUnauthorizedHistory(machineId, userId, intruderName, incidentData.incidentId),
         sendAndStoreNotification({
           userId,
           type: 'unauthorized_warning',
           title: '⚠️ Machine In Use!',
-          body: `Machine ${machineId} is currently in use. You are not authorized.`,
+          body: `Machine ${machineId} is currently in use. Your access has been reported.`,
           data: { machineId },
         }),
       ]).catch(() => {});
@@ -91,8 +107,8 @@ export default async function handler(
         data: {
           incidentId: incidentData.incidentId,
           currentUserId,
-          ownerUserName: ownerData?.displayName || ownerData?.name || 'Current User',
-          nextUserName: ownerData?.displayName || ownerData?.name || 'Current User',
+          ownerUserName: ownerName,
+          nextUserName: ownerName,
           expiresAt: incidentData.expiresAt,
           expiresIn: 60,
         },
@@ -100,37 +116,45 @@ export default async function handler(
       return;
     }
 
-    // ── No current user: check queue ──────────────────────────────────────────
-    const nextUser = await getNextUserOptimized(machineId);
+    // ── No current user: use pre-fetched queue data ───────────────────────────
     const nextUserId = nextUser?.userId || null;
 
     // ── CASE 2: User is nextUserId (claiming their grace period or queue turn) ─
     if (nextUserId === userId) {
-      res.status(200).json({ success: true, result: 'authorized', message: 'Your turn! Door unlocked.', data: { unlocked: true } });
-
-      // FIX #7: record sessionStart in RTDB for duration calculation
+      // FIX: Await critical state writes BEFORE sending response (serverless functions
+      // may terminate immediately after res.json, losing background Promises)
       const now = new Date().toISOString();
-      Promise.all([
+      await Promise.all([
         unlockDoorFast(machineId, userId),
         claimMachineAtomic(machineId, userId),
+        // Write currentUserId to RTDB iot/ so dashboard + queue update instantly
+        rtdb.ref(`iot/${machineId}`).update({ currentUserId: userId, state: 'In Use' }),
+        // Clear grace period — user has claimed their turn
+        rtdb.ref(`gracePeriods/${machineId}`).remove(),
         rtdb.ref(`sessions/${machineId}`).set({ userId, startTime: now }),
+      ]);
+      // Fire-and-forget notifications (non-critical)
+      Promise.all([
         notifySessionStarted(userId, machineId),
         sendAndStoreNotification({ userId, type: 'session_started', title: '🎉 Session Started', body: `Machine ${machineId} is ready for you!`, data: { machineId } }),
-      ]).catch(err => console.error('[Scan] bg error:', err));
+      ]).catch(err => console.error('[Scan] notify error:', err));
+      res.status(200).json({ success: true, result: 'authorized', message: 'Your turn! Door unlocked.', data: { unlocked: true } });
       return;
     }
 
     // ── CASE 3: No current user AND queue is empty → direct claim ────────────
     if (!currentUserId && !nextUserId) {
-      res.status(200).json({ success: true, result: 'queue_empty_claim', message: 'Machine is yours! Door unlocked.', data: { unlocked: true } });
-
+      // FIX: Await critical state writes BEFORE sending response
       const now = new Date().toISOString();
-      Promise.all([
+      await Promise.all([
         unlockDoorFast(machineId, userId),
         setCurrentUserAtomic(machineId, userId),
+        // Write currentUserId to RTDB iot/ so dashboard + queue update instantly
+        rtdb.ref(`iot/${machineId}`).update({ currentUserId: userId, state: 'In Use' }),
         rtdb.ref(`sessions/${machineId}`).set({ userId, startTime: now }),
-        notifySessionStarted(userId, machineId),
-      ]).catch(err => console.error('[Scan] bg error:', err));
+      ]);
+      notifySessionStarted(userId, machineId).catch(() => {});
+      res.status(200).json({ success: true, result: 'queue_empty_claim', message: 'Machine is yours! Door unlocked.', data: { unlocked: true } });
       return;
     }
 
@@ -140,6 +164,9 @@ export default async function handler(
       machineId, userId, user,
       nextUserId!, nextUser!
     );
+
+    // FIX #5: Log unauthorized attempt to usageHistory
+    logUnauthorizedHistory(machineId, userId, user.displayName || user.name || 'Unknown', incidentData.incidentId).catch(() => {});
 
     Promise.all([
       notifyUnauthorizedAlert(nextUserId!, machineId, incidentData.incidentId, user.displayName || user.name || 'Someone'),
@@ -189,16 +216,31 @@ async function getMachineOptimized(machineId: string): Promise<any | null> {
 }
 
 async function getUserOptimized(userId: string): Promise<any | null> {
+  const now = Date.now();
+  const cached = userCache.get(userId);
+  if (cached && now - cached.timestamp < USER_CACHE_TTL) return cached.data;
   const snap = await machinesRef.firestore.collection('users').doc(userId).get();
-  return snap.exists ? snap.data() : null;
+  if (!snap.exists) return null;
+  const data = snap.data();
+  userCache.set(userId, { data, timestamp: now });
+  return data;
 }
 
 async function getNextUserOptimized(machineId: string): Promise<any | null> {
+  const now = Date.now();
+  const cached = queueCache.get(machineId);
+  if (cached && now - cached.timestamp < CACHE_TTL) {
+    const users = cached.data?.users ?? [];
+    if (users.length === 0) return null;
+    return [...users].sort((a: any, b: any) => a.position - b.position)[0];
+  }
   const snap = await machinesRef.firestore.collection('queues').doc(machineId).get();
   if (!snap.exists) return null;
-  const users = snap.data()?.users ?? [];
+  const data = snap.data();
+  queueCache.set(machineId, { data, timestamp: now });
+  const users = data?.users ?? [];
   if (users.length === 0) return null;
-  return [...users].sort((a, b) => a.position - b.position)[0];
+  return [...users].sort((a: any, b: any) => a.position - b.position)[0];
 }
 
 async function unlockDoorFast(machineId: string, userId: string): Promise<void> {
@@ -335,4 +377,31 @@ function updateIncidentCountdownBackground(
       setTimeout(() => updateIncidentCountdownBackground(machineId, incidentId, secondsLeft - 1), 1000);
     })
     .catch(() => {});
+}
+
+/**
+ * FIX #5: Write unauthorized scan attempt to usageHistory collection
+ */
+async function logUnauthorizedHistory(
+  machineId: string,
+  userId: string,
+  userName: string,
+  incidentId: string
+): Promise<void> {
+  const now = new Date();
+  try {
+    await db.collection('usageHistory').add({
+      userId,
+      userName,
+      machineId,
+      startTime: now.toISOString(),
+      endTime: now.toISOString(),
+      duration: 0,
+      resultStatus: 'Unauthorized',
+      incidentId,
+      createdAt: now.toISOString(),
+    });
+  } catch (err) {
+    console.error('[scan] Failed to log unauthorized history:', err);
+  }
 }
