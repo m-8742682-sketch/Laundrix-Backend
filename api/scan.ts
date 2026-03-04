@@ -62,6 +62,43 @@ export default async function handler(
 
     const currentUserId = machine.currentUserId || null;
 
+    // ── SECURITY: Block scan if user is already USING or IN QUEUE for another machine ──
+    // This enforces one-machine-at-a-time policy at the scan level.
+    // (queue.ts already enforces this on join; scan.ts must also check so users
+    //  cannot bypass by scanning directly without joining the queue.)
+    if (currentUserId !== userId) {
+      // Check if this user is currently using any OTHER machine
+      const otherMachineAsCurrentSnap = await machinesRef.where('currentUserId', '==', userId).get();
+      if (!otherMachineAsCurrentSnap.empty) {
+        const otherMachineId = otherMachineAsCurrentSnap.docs[0].id;
+        if (otherMachineId !== machineId) {
+          res.status(400).json({
+            success: false,
+            result: 'unauthorized' as ScanResult,
+            message: `You are already using Machine ${otherMachineId}. Please release it before using another machine.`,
+            data: { ownerUserName: '', ownerUserId: '', machineId: otherMachineId },
+          });
+          return;
+        }
+      }
+
+      // Check if this user is already in the queue for any OTHER machine
+      const allQueuesSnap = await machinesRef.firestore.collection('queues').get();
+      for (const qDoc of allQueuesSnap.docs) {
+        if (qDoc.id === machineId) continue;
+        const users: any[] = qDoc.data()?.users ?? [];
+        if (users.some((u: any) => u.userId === userId)) {
+          res.status(400).json({
+            success: false,
+            result: 'unauthorized' as ScanResult,
+            message: `You are already in the queue for Machine ${qDoc.id}. Leave that queue first before using another machine.`,
+            data: { ownerUserName: '', ownerUserId: '', machineId: qDoc.id },
+          });
+          return;
+        }
+      }
+    }
+
     // ── CASE 1: User is already the current user (re-entry) ──────────────────
     if (currentUserId === userId) {
       // Parallel: unlock door + update RTDB state

@@ -172,8 +172,7 @@ async function handleExpired(
   // Remove user from queue
   await removeUserFromQueue(machineId, userId);
 
-  // Notify removed user
-  await notifyRemovedFromQueue(userId, machineId);
+  // Notify removed user — single notification only
   await sendAndStoreNotification({
     userId,
     type: 'removed_from_queue',
@@ -191,7 +190,7 @@ async function handleExpired(
   
   if (nextUser) {
     // Start new grace period for next user
-    await startNewGracePeriod(machineId, nextUser.userId, gracePeriodRef);
+    await startNewGracePeriod(machineId, nextUser.userId, gracePeriodRef, nextUser.name || 'Unknown');
     
     // Notify new next user
     await notifyYourTurn(nextUser.userId, machineId);
@@ -222,7 +221,8 @@ async function handleExpired(
 async function startNewGracePeriod(
   machineId: string, 
   userId: string,
-  gracePeriodRef: any
+  gracePeriodRef: any,
+  userName: string = 'Unknown'
 ): Promise<void> {
   const now = new Date();
   const warningAt = new Date(now.getTime() + 2 * 60 * 1000);   // +2 minutes
@@ -231,11 +231,14 @@ async function startNewGracePeriod(
   const gracePeriod: GracePeriod = {
     machineId,
     userId,
+    userName,            // written so client can display name without extra fetch
     startedAt: now.toISOString(),
     warningAt: warningAt.toISOString(),
     expiresAt: expiresAt.toISOString(),
     warningSent: false,
     status: 'active',
+    ringSilenced: false,   // SYNC: all devices start ringing
+    dismissed: false,      // SYNC: all devices show modal
   };
 
   await gracePeriodRef.set(gracePeriod);

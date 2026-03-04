@@ -56,6 +56,8 @@ export interface GracePeriod {
   warningAt: string;        // startedAt + 2 minutes
   warningSent: boolean;
   status: 'active' | 'claimed' | 'expired';
+  ringSilenced?: boolean;  // written by any device to stop alarm on all devices
+  dismissed?: boolean;     // written by any device to close modal on all devices
 }
 
 // Usage record — FIX #7: stored in Firestore usageHistory

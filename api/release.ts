@@ -178,6 +178,8 @@ async function startGracePeriod(machineId: string, userId: string, userName: str
     expiresAt: expiresAt.toISOString(),
     warningSent: false,
     status: 'active',
+    ringSilenced: false,   // SYNC: all devices start ringing
+    dismissed: false,      // SYNC: all devices show modal
   };
 
   await rtdb.ref(`gracePeriods/${machineId}`).set(gracePeriod);

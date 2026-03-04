@@ -7,7 +7,7 @@
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { handleCors } from '../lib/cors';
-import { incidentsRef, getCommandsRef } from '../lib/firebase';
+import { incidentsRef, getIotRef} from '../lib/firebase';
 import { notifyBuzzerTriggered, sendAndStoreNotification } from '../lib/fcm';
 import type { IncidentActionRequest, ApiResponse, Incident } from '../lib/types';
 
@@ -159,8 +159,9 @@ async function handleTimeout(incidentId: string, incident: Incident): Promise<vo
 }
 
 async function triggerBuzzer(machineId: string, activate: boolean): Promise<void> {
-  const commandsRef = getCommandsRef(machineId);
-  await commandsRef.update({ buzzer: activate, buzzerAt: new Date().toISOString() });
+  await getIotRef(machineId).update({ 
+    buzzerState: activate 
+  });
 }
 
 async function notifyAdmins(

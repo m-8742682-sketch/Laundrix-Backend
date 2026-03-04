@@ -68,8 +68,7 @@ export default async function handler(
           // Remove from queue
           await removeUserFromQueue(machineId, gp.userId);
 
-          // Notify removed user
-          await notifyRemovedFromQueue(gp.userId, machineId);
+          // Notify removed user — single notification only
           await sendAndStoreNotification({
             userId: gp.userId,
             type: "removed_from_queue",
@@ -92,11 +91,14 @@ export default async function handler(
             await rtdb.ref(`gracePeriods/${machineId}`).set({
               machineId,
               userId:     nextUser.userId,
+              userName:   nextUser.name || 'Unknown',
               startedAt:  newStart.toISOString(),
               warningAt:  newWarning.toISOString(),
               expiresAt:  newExpiry.toISOString(),
               warningSent: false,
               status:     "active",
+              ringSilenced: false,   // SYNC: all devices start ringing
+              dismissed: false,      // SYNC: all devices show modal
             } as GracePeriod);
 
             await notifyYourTurn(nextUser.userId, machineId);
