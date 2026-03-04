@@ -22,7 +22,8 @@ import {
   notifySessionEnded,
   sendAndStoreNotification
 } from '../lib/fcm';
-import type { ReleaseRequest, ApiResponse, GracePeriod } from '../lib/types';
+import { startGracePeriod } from '../lib/grace';
+import type { ReleaseRequest, ApiResponse } from '../lib/types';
 
 export default async function handler(
   req: VercelRequest,
@@ -164,24 +165,4 @@ async function unlockDoor(machineId: string): Promise<void> {
   });
 }
 
-async function startGracePeriod(machineId: string, userId: string, userName: string): Promise<void> {
-  const now = new Date();
-  const warningAt = new Date(now.getTime() + 2 * 60 * 1000);
-  const expiresAt = new Date(now.getTime() + 5 * 60 * 1000); // 5 minutes
-
-  const gracePeriod: GracePeriod = {
-    machineId,
-    userId,
-    userName,
-    startedAt: now.toISOString(),
-    warningAt: warningAt.toISOString(),
-    expiresAt: expiresAt.toISOString(),
-    warningSent: false,
-    status: 'active',
-    ringSilenced: false,   // SYNC: all devices start ringing
-    dismissed: false,      // SYNC: all devices show modal
-  };
-
-  await rtdb.ref(`gracePeriods/${machineId}`).set(gracePeriod);
-  console.log(`[release] Grace period started for ${userId} on ${machineId} — expires in 5 min`);
-}
+// startGracePeriod is imported from lib/grace.ts

@@ -8,7 +8,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { handleCors } from '../lib/cors';
 import { incidentsRef, getIotRef} from '../lib/firebase';
-import { notifyBuzzerTriggered, sendAndStoreNotification } from '../lib/fcm';
+import { sendAndStoreNotification } from '../lib/fcm';
 import type { IncidentActionRequest, ApiResponse, Incident } from '../lib/types';
 
 export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
@@ -66,7 +66,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
 
 function getOwnerUserId(incident: Incident): string {
   // FIX #6: support ownerUserId field; fall back to nextUserId for backward compat
-  return (incident as any).ownerUserId || incident.nextUserId;
+  return incident.ownerUserId || incident.nextUserId;
 }
 
 async function handleConfirmNotMe(incidentId: string, incident: Incident, userId: string): Promise<void> {

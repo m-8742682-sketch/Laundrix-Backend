@@ -1,96 +1,68 @@
 /**
  * POST /api/claim-grace
- * 
- * Called when nextUserId successfully scans during grace period
- * This clears the grace period countdown
- * 
- * Request body: { machineId: string, userId: string }
+ *
+ * Called when nextUserId successfully scans QR during grace period.
+ * Sets status → "claimed" so ALL clients (user + admins) immediately
+ * dismiss their grace modals and stop alarms.
+ *
+ * Body: { machineId: string, userId: string }
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { handleCors } from '../lib/cors';
 import { rtdb } from '../lib/firebase';
-import type { ApiResponse, GracePeriod } from '../lib/types';
-
-interface ClaimGraceRequest {
-  machineId: string;
-  userId: string;
-}
+import { claimGracePeriod } from '../lib/grace';
+import type { GracePeriod, ApiResponse } from '../lib/types';
 
 export default async function handler(
   req: VercelRequest,
   res: VercelResponse
 ): Promise<void> {
-  // Handle CORS
   if (handleCors(req, res)) return;
-
-  // Only allow POST
   if (req.method !== 'POST') {
     res.status(405).json({ success: false, error: 'Method not allowed' });
     return;
   }
 
   try {
-    const { machineId, userId } = req.body as ClaimGraceRequest;
+    const { machineId, userId } = req.body as { machineId: string; userId: string };
 
-    // Validate input
     if (!machineId || !userId) {
-      res.status(400).json({ 
-        success: false, 
-        error: 'Missing machineId or userId' 
-      });
+      res.status(400).json({ success: false, error: 'Missing machineId or userId' });
       return;
     }
 
-    // Get grace period data
-    const gracePeriodRef = rtdb.ref(`gracePeriods/${machineId}`);
+    const gracePeriodRef      = rtdb.ref(`gracePeriods/${machineId}`);
     const gracePeriodSnapshot = await gracePeriodRef.get();
-    
+
     if (!gracePeriodSnapshot.exists()) {
-      // No grace period, that's okay - machine might have been claimed directly
-      res.status(200).json({ 
-        success: true, 
-        message: 'No active grace period to clear',
-        data: { cleared: false }
-      });
+      // No grace period active — that's fine, scan already handled it
+      res.status(200).json({ success: true, message: 'No active grace period', data: { cleared: false } });
       return;
     }
 
     const gracePeriod = gracePeriodSnapshot.val() as GracePeriod;
 
-    // Verify this is the correct user
+    // Verify correct user
     if (gracePeriod.userId !== userId) {
-      res.status(403).json({ 
-        success: false, 
-        error: 'Grace period is for a different user' 
-      });
+      res.status(403).json({ success: false, error: 'Grace period is for a different user' });
       return;
     }
 
-    // Mark as claimed and clear
-    await gracePeriodRef.update({
-      status: 'claimed',
-      claimedAt: new Date().toISOString(),
-    });
+    // Already handled
+    if (gracePeriod.status !== 'active') {
+      res.status(200).json({ success: true, message: `Grace already ${gracePeriod.status}`, data: { cleared: false } });
+      return;
+    }
 
-    // Remove after a short delay (for logging purposes)
-    setTimeout(async () => {
-      await gracePeriodRef.remove();
-    }, 5000);
+    // Mark claimed — all listening clients will immediately stop countdown + dismiss modal
+    await claimGracePeriod(machineId);
 
-    console.log(`Grace period claimed by ${userId} for ${machineId}`);
-
-    res.status(200).json({
-      success: true,
-      message: 'Grace period cleared. Enjoy your wash!',
-      data: { cleared: true }
-    });
+    console.log(`[claim-grace] ${userId} claimed grace on ${machineId}`);
+    res.status(200).json({ success: true, message: 'Grace period cleared.', data: { cleared: true } });
 
   } catch (error) {
-    console.error('Claim grace error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Internal server error' 
-    });
+    console.error('[claim-grace] error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }

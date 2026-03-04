@@ -20,7 +20,7 @@ import {
 } from '../lib/queue';
 import { sendAndStoreNotification } from '../lib/fcm';
 import { rtdb } from '../lib/firebase';
-import type { GracePeriod } from '../lib/types';
+import { startGracePeriod } from '../lib/grace';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -170,7 +170,7 @@ async function handleJoin(
 
   if (isMachineFree && isFirstInQueue) {
     backgroundTasks.push(
-      startGracePeriodForUser(machineId, userId, resolvedName),
+      startGracePeriod(machineId, userId, resolvedName),
       sendAndStoreNotification({
         userId,
         type: 'your_turn',
@@ -235,24 +235,4 @@ async function handleLeave(
   res.status(200).json({ success: true, message: 'Successfully left the queue' });
 }
 
-// ─── Grace period helper (mirrors release.ts startGracePeriod) ────────────────
-
-async function startGracePeriodForUser(machineId: string, userId: string, userName: string): Promise<void> {
-  const now = new Date();
-  const warningAt = new Date(now.getTime() + 2 * 60 * 1000);
-  const expiresAt = new Date(now.getTime() + 5 * 60 * 1000);
-
-  const gracePeriod: GracePeriod = {
-    machineId,
-    userId,
-    userName,
-    startedAt: now.toISOString(),
-    warningAt: warningAt.toISOString(),
-    expiresAt: expiresAt.toISOString(),
-    warningSent: false,
-    status: 'active',
-  };
-
-  await rtdb.ref(`gracePeriods/${machineId}`).set(gracePeriod);
-  console.log(`[queue/join] Grace period started for ${userId} (${userName}) on ${machineId} (machine was free)`);
-}
+// startGracePeriod is imported from lib/grace.ts
