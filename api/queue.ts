@@ -218,6 +218,28 @@ async function handleLeave(
     return;
   }
 
+  // ── BUG FIX (Bug 2 & 3): Immediately expire grace period if user leaves during grace
+  // This ensures all clients (admin modal, dashboard card, queue card) dismiss at once
+  // rather than waiting for the cron job (up to 1 min delay).
+  let graceExpired = false;
+  try {
+    const graceRef  = rtdb.ref(`gracePeriods/${machineId}`);
+    const graceSnap = await graceRef.get();
+    if (graceSnap.exists()) {
+      const grace = graceSnap.val();
+      if (grace?.userId === userId && grace?.status === 'active') {
+        // Mark expired first (all RTDB listeners dismiss their modals)
+        await graceRef.update({ status: 'expired', expiredAt: new Date().toISOString() });
+        // Then immediately delete the node (no setTimeout — serverless functions don't keep alive)
+        await graceRef.remove();
+        graceExpired = true;
+        console.log(`[queue/leave] Grace period expired immediately for ${userId} on ${machineId}`);
+      }
+    }
+  } catch (graceError) {
+    console.warn('[queue/leave] Grace cleanup failed (non-fatal):', graceError);
+  }
+
   // Background: update nextUserId + notify
   Promise.all([
     updateNextUserId(machineId),
@@ -230,9 +252,9 @@ async function handleLeave(
     }),
   ]).catch((err) => console.error('[queue/leave] background error:', err));
 
-  console.log(`User ${userId} left queue for ${machineId}`);
+  console.log(`User ${userId} left queue for ${machineId}${graceExpired ? ' (grace expired)' : ''}`);
 
-  res.status(200).json({ success: true, message: 'Successfully left the queue' });
+  res.status(200).json({ success: true, message: 'Successfully left the queue', data: { graceExpired } });
 }
 
 // startGracePeriod is imported from lib/grace.ts
