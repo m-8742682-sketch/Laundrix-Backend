@@ -32,12 +32,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
     }
     const incident = incidentDoc.data() as Incident;
 
-    if (incident.status !== 'pending') {
+    if (!['pending', 'pre_pending'].includes(incident.status)) {
       res.status(400).json({ success: false, error: `Incident already ${incident.status}`, data: { status: incident.status } });
       return;
     }
 
     switch (action) {
+      case 'confirm':
+        // Intruder confirmed "Yes, I'll proceed" — activate the incident
+        await handleConfirm(incidentId, incident, userId);
+        res.status(200).json({ success: true, message: 'Incident confirmed. Owner, admin, and intruder notified.', data: { status: 'confirmed_active' } });
+        break;
+
       case 'confirm_not_me':
         await handleConfirmNotMe(incidentId, incident, userId);
         res.status(200).json({ success: true, message: 'Confirmed. Buzzer activated.', data: { status: 'confirmed', buzzerTriggered: true } });
@@ -194,4 +200,38 @@ async function notifyAdmins(
   } catch (err) {
     console.error('[notifyAdmins] failed:', err);
   }
+}
+// ── handleConfirm — intruder said "Yes, proceed" ──────────────────────────────
+async function handleConfirm(incidentId: string, incident: any, userId: string): Promise<void> {
+  const ownerUserId = incident.ownerUserId || incident.nextUserId;
+  const now = new Date().toISOString();
+
+  // Activate the incident → now visible to owner/admin/intruder in GlobalIncidentModal
+  await incidentsRef.doc(incidentId).update({
+    status: 'pending',
+    confirmedAt: now,
+    confirmedBy: userId,
+  });
+
+  // Notify owner, admin, and intruder simultaneously
+  await Promise.allSettled([
+    sendAndStoreNotification({
+      userId: ownerUserId,
+      type: 'unauthorized_alert',
+      title: '🚨 Someone Is Using Your Machine!',
+      body: `${incident.intruderName} is using Machine ${incident.machineId}. Please confirm: is this you?`,
+      data: { machineId: incident.machineId, incidentId, type: 'incident_owner' },
+      priority: 'high',
+    }),
+    sendAndStoreNotification({
+      userId: incident.intruderId,
+      type: 'unauthorized_warning',
+      title: '⚠️ Your Action Has Been Reported',
+      body: `You are using Machine ${incident.machineId} without authorization. The owner and admin have been notified.`,
+      data: { machineId: incident.machineId, incidentId, type: 'incident_intruder' },
+      priority: 'high',
+    }),
+    notifyAdmins(incident.machineId, incidentId, '🚨 Unauthorized Access Alert',
+      `${incident.intruderName} is using Machine ${incident.machineId} (owned by ${incident.ownerUserName}).`),
+  ]);
 }

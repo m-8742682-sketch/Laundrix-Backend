@@ -23,7 +23,7 @@ import type { ScanRequest, ScanResponse, ScanResult, Incident } from '../lib/typ
 const machineCache = new Map<string, { data: any; timestamp: number }>();
 const userCache = new Map<string, { data: any; timestamp: number }>();
 const queueCache = new Map<string, { data: any; timestamp: number }>();
-const CACHE_TTL = 4000;  // 4s cache — short enough to be fresh
+const CACHE_TTL = 500;  // 0.5s — must be fresh immediately after join/scan
 const USER_CACHE_TTL = 30000; // Users change rarely — 30s cache
 
 export default async function handler(
@@ -344,7 +344,7 @@ async function createIncidentFast(
     ownerUserName: ownerData.displayName || ownerData.name || 'Unknown',
     nextUserId: ownerUserId,      // backward compat
     nextUserName: ownerData.displayName || ownerData.name || 'Unknown',
-    status: 'pending',
+    status: 'pre_pending',  // becomes 'pending' only after intruder confirms
     createdAt: now.toISOString(),
     expiresAt: expiresAt.toISOString(),
     resolvedAt: null,

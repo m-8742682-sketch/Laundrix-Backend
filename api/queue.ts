@@ -157,8 +157,20 @@ async function handleJoin(
   const isFirstInQueue = queueUser.position === 1;
   const resolvedName = userName || (user as any).displayName || (user as any).name || 'Unknown';
 
+  // ── Situation A: machine free + user is #1 in queue → start grace period NOW ─
+  // CRITICAL: startGracePeriod must be AWAITED before sending the response.
+  // Previously it was fire-and-forget in backgroundTasks, causing a race where
+  // the frontend subscription fired (seeing the new queue entry) BEFORE the grace
+  // node existed in RTDB — so GraceAlarmModal found nothing and never showed.
+  if (isMachineFree && isFirstInQueue) {
+    await startGracePeriod(machineId, userId, resolvedName);
+  }
+
+  // Non-critical notifications — fire-and-forget (no await needed)
   const backgroundTasks: Promise<any>[] = [
-    updateNextUserId(machineId),
+    // NOTE: addUserToQueue already updates nextUserId in its transaction for
+    // position-1 users, so updateNextUserId is only needed for subsequent users.
+    ...(isFirstInQueue ? [] : [updateNextUserId(machineId)]),
     sendAndStoreNotification({
       userId,
       type: 'queue_joined',
@@ -166,11 +178,7 @@ async function handleJoin(
       body: `You are #${queueUser.position} in line for Machine ${machineId}.`,
       data: { machineId, position: queueUser.position.toString() },
     }),
-  ];
-
-  if (isMachineFree && isFirstInQueue) {
-    backgroundTasks.push(
-      startGracePeriod(machineId, userId, resolvedName),
+    ...(isMachineFree && isFirstInQueue ? [
       sendAndStoreNotification({
         userId,
         type: 'your_turn',
@@ -179,9 +187,9 @@ async function handleJoin(
         data: { machineId },
         sound: 'alarm',
         priority: 'high',
-      })
-    );
-  }
+      }),
+    ] : []),
+  ];
 
   Promise.all(backgroundTasks).catch((err) => console.error('[queue/join] background error:', err));
 
@@ -218,28 +226,6 @@ async function handleLeave(
     return;
   }
 
-  // ── BUG FIX (Bug 2 & 3): Immediately expire grace period if user leaves during grace
-  // This ensures all clients (admin modal, dashboard card, queue card) dismiss at once
-  // rather than waiting for the cron job (up to 1 min delay).
-  let graceExpired = false;
-  try {
-    const graceRef  = rtdb.ref(`gracePeriods/${machineId}`);
-    const graceSnap = await graceRef.get();
-    if (graceSnap.exists()) {
-      const grace = graceSnap.val();
-      if (grace?.userId === userId && grace?.status === 'active') {
-        // Mark expired first (all RTDB listeners dismiss their modals)
-        await graceRef.update({ status: 'expired', expiredAt: new Date().toISOString() });
-        // Then immediately delete the node (no setTimeout — serverless functions don't keep alive)
-        await graceRef.remove();
-        graceExpired = true;
-        console.log(`[queue/leave] Grace period expired immediately for ${userId} on ${machineId}`);
-      }
-    }
-  } catch (graceError) {
-    console.warn('[queue/leave] Grace cleanup failed (non-fatal):', graceError);
-  }
-
   // Background: update nextUserId + notify
   Promise.all([
     updateNextUserId(machineId),
@@ -252,9 +238,9 @@ async function handleLeave(
     }),
   ]).catch((err) => console.error('[queue/leave] background error:', err));
 
-  console.log(`User ${userId} left queue for ${machineId}${graceExpired ? ' (grace expired)' : ''}`);
+  console.log(`User ${userId} left queue for ${machineId}`);
 
-  res.status(200).json({ success: true, message: 'Successfully left the queue', data: { graceExpired } });
+  res.status(200).json({ success: true, message: 'Successfully left the queue' });
 }
 
 // startGracePeriod is imported from lib/grace.ts

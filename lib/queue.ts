@@ -268,7 +268,7 @@ export async function setCurrentUser(
 // ─── In-memory caches ────────────────────────────────────────────────────────
 const _machineCache = new Map<string, { data: any; ts: number }>();
 const _userCache = new Map<string, { data: any; ts: number }>();
-const CACHE_TTL = 4000;
+const CACHE_TTL = 500;  // 0.5s — must be fresh immediately after join/scan/release
 const USER_CACHE_TTL = 30000;
 
 export async function getMachine(

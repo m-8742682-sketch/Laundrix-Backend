@@ -45,6 +45,7 @@ export default async function handler(
         callId,
         callerId,
         callerName,
+        callerAvatar,
         recipientId,
         isVideo,
       } = req.body as {
@@ -52,6 +53,7 @@ export default async function handler(
         callId: string;
         callerId: string;
         callerName: string;
+        callerAvatar?: string;
         recipientId: string;
         isVideo: boolean;
       };
@@ -79,8 +81,8 @@ export default async function handler(
 
         // Send push notification
         const sent = isVideo
-          ? await notifyIncomingVideoCall(recipientId, callerName, callId)
-          : await notifyIncomingVoiceCall(recipientId, callerName, callId);
+          ? await notifyIncomingVideoCall(recipientId, callerName, callId, callerId, callerAvatar)
+          : await notifyIncomingVoiceCall(recipientId, callerName, callId, callerId, callerAvatar);
 
         res.status(200).json({
           success: true,

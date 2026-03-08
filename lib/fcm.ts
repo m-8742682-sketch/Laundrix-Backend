@@ -201,10 +201,23 @@ export async function sendNotification(payload: NotificationPayload): Promise<bo
     // Data-only messages are NOT shown by Android when the app is killed.
     // The `notification` field triggers the system to display the notification
     // even with the app terminated.
+    //
+    // FULL-SCREEN INTENT: Android will automatically promote a MAX-importance
+    // notification to a full-screen activity if:
+    //  1. The app has USE_FULL_SCREEN_INTENT permission granted
+    //  2. The notification channel has IMPORTANCE_HIGH or MAX
+    //  3. The device is locked or the screen is off
+    // We achieve this via the `calls` / `critical` channels (already MAX + bypassDnd).
+    const isCallOrCritical = resolvedChannel === 'calls' || resolvedChannel === 'critical';
+    // For voice/video calls: data-only (no notification field) so the FCM background
+    // handler can intercept and show notifee full-screen intent. If notification field
+    // is present, Android short-circuits and shows a system notification directly,
+    // bypassing the background handler and preventing full-screen call UI.
+    const isCallNotification = type === 'voice_call' || type === 'video_call';
     const message: admin.messaging.Message = {
       token: fcmToken,
-      // notification field = displayed by the OS on kill/background
-      notification: { title, body },
+      // data-only for calls — notifee background handler handles display
+      ...(!isCallNotification ? { notification: { title, body } } : {}),
       // data field = available to the app when it opens
       data: {
         type,
@@ -213,19 +226,38 @@ export async function sendNotification(payload: NotificationPayload): Promise<bo
         ...Object.fromEntries(
           Object.entries(data).map(([k, v]) => [k, String(v)])
         ),
+        // Pass title + body in data as well so the background JS handler can
+        // re-schedule with the correct content when Firebase auto-displays
+        // the notification before the JS handler fires.
+        title,
+        body,
       },
       android: {
-        priority: priority as 'normal' | 'high',
+        priority: 'high', // always high so device wakes for critical alerts
+        // time_to_live: 0 for calls — don't deliver a stale call notification
+        ...(resolvedChannel === 'calls' ? { ttl: 0 } : {}),
         notification: {
           channelId: resolvedChannel,
           sound: soundFile === 'default' ? undefined : soundFile,
           defaultSound: soundFile === 'default',
-          defaultVibrateTimings: true,
           visibility: 'public',
           notificationCount: 1,
-          // Ensure notification is shown on lock screen
           localOnly: false,
+          // For calls: set notification priority to MAX so Android auto-invokes
+          // the full-screen intent (USE_FULL_SCREEN_INTENT) when screen is locked.
+          notificationPriority: isCallOrCritical
+            ? 'PRIORITY_MAX' as any
+            : 'PRIORITY_DEFAULT' as any,
+          ...(isCallOrCritical
+            ? {
+                sticky: resolvedChannel === 'calls',
+                defaultVibrateTimings: false,
+                vibrateTimingsMillis: [0, 500, 200, 500, 200, 500],
+              }
+            : { defaultVibrateTimings: true }),
         },
+        // direct_boot_ok delivers even before device unlock (API 24+)
+        directBootOk: isCallOrCritical,
       },
       apns: {
         headers: {
@@ -453,14 +485,24 @@ export async function notifyChatMessage(
 export async function notifyIncomingVoiceCall(
   userId: string,
   callerName: string,
-  callId: string
+  callId: string,
+  callerId: string = '',
+  callerAvatar: string = ''
 ): Promise<boolean> {
   return sendNotification({
     userId,
     type: 'voice_call',
     title: '📞 Incoming Call',
     body: `${callerName} is calling you`,
-    data: { callId, callerName },
+    // CRITICAL: callerId + callerAvatar must be in data so that when user taps the
+    // push notification from a killed/background state, the incoming call screen
+    // receives all params it needs to accept/reject the call correctly.
+    data: {
+      callId,
+      callerName,
+      callerId,
+      ...(callerAvatar ? { callerAvatar } : {}),
+    },
     priority: 'high',
   });
 }
@@ -469,14 +511,21 @@ export async function notifyIncomingVoiceCall(
 export async function notifyIncomingVideoCall(
   userId: string,
   callerName: string,
-  callId: string
+  callId: string,
+  callerId: string = '',
+  callerAvatar: string = ''
 ): Promise<boolean> {
   return sendNotification({
     userId,
     type: 'video_call',
     title: '📹 Incoming Video Call',
     body: `${callerName} is video calling you`,
-    data: { callId, callerName },
+    data: {
+      callId,
+      callerName,
+      callerId,
+      ...(callerAvatar ? { callerAvatar } : {}),
+    },
     priority: 'high',
   });
 }

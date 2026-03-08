@@ -106,18 +106,20 @@ export default async function handler(
       ]).catch(err => console.error('[release] usageHistory write failed:', err));
     }
 
-    // Notify session ended
-    await notifySessionEnded(userId, machineId);
-    sendAndStoreNotification({
-      userId,
-      type: 'session_ended',
-      title: '👋 Session Ended',
-      body: `Your session at Machine ${machineId} has ended.`,
-      data: { machineId },
-    }).catch(() => {});
-
-    // Check for next user and start grace period
-    const nextUser = await getNextUser(machineId);
+    // Notify session ended + get next user in parallel — both are independent.
+    // Previously notifySessionEnded was awaited before getNextUser, adding ~0.2-0.5s
+    // to the critical path on every release. Now they run concurrently.
+    const [nextUser] = await Promise.all([
+      getNextUser(machineId),
+      notifySessionEnded(userId, machineId).catch(() => {}),
+      sendAndStoreNotification({
+        userId,
+        type: 'session_ended',
+        title: '👋 Session Ended',
+        body: `Your session at Machine ${machineId} has ended.`,
+        data: { machineId },
+      }).catch(() => {}),
+    ]);
 
     if (nextUser) {
       await startGracePeriod(machineId, nextUser.userId, nextUser.name || 'Unknown');
