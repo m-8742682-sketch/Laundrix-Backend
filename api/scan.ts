@@ -356,8 +356,8 @@ async function createIncidentFast(
     rtdb.ref(`incidents/${machineId}/${incidentId}`).set({ ...incident, secondsLeft: 60 }),
   ]);
 
-  // Background countdown
-  updateIncidentCountdownBackground(machineId, incidentId, 60);
+  // Note: timeout is handled by the cron job (runs every minute), not here.
+  // The RTDB countdown was removed — serverless functions can't maintain setTimeout reliably.
   return { incidentId, expiresAt: expiresAt.toISOString() };
 }
 
@@ -402,10 +402,24 @@ function updateIncidentCountdownBackground(
   secondsLeft: number
 ): void {
   if (secondsLeft <= 0) {
-    rtdb.ref(`incidents/${machineId}/${incidentId}`)
-      .update({ secondsLeft: 0, status: 'timeout' })
-      .then(() => getCommandsRef(machineId).update({ buzzer: true, buzzerAt: new Date().toISOString() }))
-      .catch(() => {});
+    const now = new Date().toISOString();
+    // Update BOTH RTDB and Firestore so stale incidents don't accumulate in Firestore
+    Promise.all([
+      rtdb.ref(`incidents/${machineId}/${incidentId}`)
+        .update({ secondsLeft: 0, status: 'timeout' }),
+      incidentsRef.doc(incidentId).get().then(snap => {
+        // Only update Firestore if incident is still pre_pending (intruder never confirmed)
+        // pending incidents are handled by the client-side timeout call instead
+        if (snap.exists && snap.data()?.status === 'pre_pending') {
+          return incidentsRef.doc(incidentId).update({
+            status: 'timeout',
+            resolvedAt: now,
+            buzzerTriggered: false,
+          });
+        }
+      }),
+      getCommandsRef(machineId).update({ buzzer: true, buzzerAt: now }),
+    ]).catch(() => {});
     return;
   }
   rtdb.ref(`incidents/${machineId}/${incidentId}/secondsLeft`)

@@ -14,7 +14,7 @@
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { rtdb, incidentsRef, getCommandsRef } from '../lib/firebase';
+import { rtdb, incidentsRef, getCommandsRef, db } from '../lib/firebase';
 import { getNextUser, removeUserFromQueue, updateNextUserId } from '../lib/queue';
 import { notifyYourTurn, sendAndStoreNotification } from '../lib/fcm';
 import { startGracePeriod, expireGracePeriod } from '../lib/grace';
@@ -100,54 +100,100 @@ export default async function handler(
   }
 
   // ─────────────────────────────────────────────
-  // TASK 2: Incident Timeout (auto-buzzer)
+  // TASK 2: Incident Timeout
   // ─────────────────────────────────────────────
   try {
     const now = new Date().toISOString();
 
-    const expiredIncidents = await incidentsRef
-      .where('status', '==', 'pending')
+    // Handle owner_pending timeouts → history = Unauthorized
+    const ownerExpired = await incidentsRef
+      .where('status', '==', 'owner_pending')
       .where('expiresAt', '<=', now)
       .get();
 
-    for (const docSnap of expiredIncidents.docs) {
+    for (const docSnap of ownerExpired.docs) {
       try {
         const incident   = docSnap.data() as Incident;
         const incidentId = docSnap.id;
+        const ownerUserId = incident.ownerUserId || (incident as any).nextUserId;
 
         await incidentsRef.doc(incidentId).update({
           status:          'timeout',
           resolvedAt:      now,
-          buzzerTriggered: true,
+          buzzerTriggered: false,
           resolvedBy:      'cron',
         });
 
-        await getCommandsRef(incident.machineId).update({
-          buzzer:       true,
-          buzzerAt:     now,
-          buzzerReason: 'incident_timeout',
-        });
+        // Clear RTDB owner signal
+        await rtdb.ref(`userIncident/${ownerUserId}`).remove().catch(() => {});
 
+        // Write Unauthorized history
+        try {
+          const histSnap = await db.collection('usageHistory')
+            .where('incidentId', '==', incidentId).limit(1).get();
+          if (!histSnap.empty) {
+            await histSnap.docs[0].ref.update({ resultStatus: 'Unauthorized', updatedAt: now });
+          } else {
+            await db.collection('usageHistory').add({
+              userId: incident.intruderId, userName: incident.intruderName,
+              machineId: incident.machineId,
+              startTime: (incident as any).confirmedAt || incident.createdAt || now,
+              endTime: now, duration: 0, resultStatus: 'Unauthorized',
+              incidentId, createdAt: now,
+            });
+          }
+        } catch {}
+
+        // Notify admins
         await sendAndStoreNotification({
-          userId:   incident.intruderId,
+          userId:   ownerUserId,
           type:     'buzzer_triggered',
-          title:    '🚨 Alert Triggered',
-          body:     `Unauthorized access alert for Machine ${incident.machineId}.`,
+          title:    '🚨 Incident Timed Out',
+          body:     `No response for Machine ${incident.machineId}. Logged as Unauthorized.`,
           data:     { machineId: incident.machineId, incidentId },
-          priority: 'high',
+          priority: 'normal',
         });
 
-        await sendAndStoreNotification({
-          userId:   incident.nextUserId,
-          type:     'buzzer_triggered',
-          title:    '🚨 Auto-Alert Triggered',
-          body:     `No response received. Buzzer activated for Machine ${incident.machineId}.`,
-          data:     { machineId: incident.machineId, incidentId },
-        });
-
-        results.incidents.processed.push(`${incidentId}: ${incident.machineId} buzzer triggered`);
+        results.incidents.processed.push(`${incidentId}: owner_pending timeout → Unauthorized`);
       } catch (err: any) {
-        console.error(`[Cron] Incident error ${docSnap.id}:`, err);
+        results.incidents.errors.push(`${docSnap.id}: ${err.message}`);
+      }
+    }
+
+    // Handle pre_pending timeouts → silent close (intruder never confirmed)
+    const preExpired = await incidentsRef
+      .where('status', '==', 'pre_pending')
+      .where('expiresAt', '<=', now)
+      .get();
+
+    for (const docSnap of preExpired.docs) {
+      try {
+        await incidentsRef.doc(docSnap.id).update({
+          status: 'timeout', resolvedAt: now, buzzerTriggered: false, resolvedBy: 'cron',
+        });
+        results.incidents.processed.push(`${docSnap.id}: pre_pending timeout → silent`);
+      } catch (err: any) {
+        results.incidents.errors.push(`${docSnap.id}: ${err.message}`);
+      }
+    }
+
+    // Legacy: handle old 'pending' status incidents (backward compat)
+    const legacyExpired = await incidentsRef
+      .where('status', '==', 'pending')
+      .where('expiresAt', '<=', now)
+      .get();
+
+    for (const docSnap of legacyExpired.docs) {
+      try {
+        const incident = docSnap.data() as Incident;
+        await incidentsRef.doc(docSnap.id).update({
+          status: 'timeout', resolvedAt: now, buzzerTriggered: false, resolvedBy: 'cron',
+        });
+        await getCommandsRef(incident.machineId).update({
+          buzzer: true, buzzerAt: now, buzzerReason: 'incident_timeout',
+        });
+        results.incidents.processed.push(`${docSnap.id}: legacy pending timeout`);
+      } catch (err: any) {
         results.incidents.errors.push(`${docSnap.id}: ${err.message}`);
       }
     }

@@ -35,7 +35,7 @@ export interface Incident {
   ownerUserName: string;
   nextUserId: string;       // backward compat alias for ownerUserId
   nextUserName: string;
-  status: 'pending' | 'confirmed' | 'resolved' | 'dismissed' | 'timeout';
+  status: 'pre_pending'|'pending' | 'confirmed' | 'resolved' | 'dismissed' | 'timeout';
   createdAt: string;
   expiresAt: string;
   resolvedAt: string | null;
@@ -48,7 +48,7 @@ export interface Incident {
 export interface IncidentActionRequest {
   incidentId: string;
   userId: string;
-  action: 'confirm_not_me' | 'dismiss' | 'timeout';
+  action: 'thats_me'|'admin_dismiss'|'admin_dismiss_false'|'confirm' | 'confirm_not_me' | 'dismiss' | 'timeout';
   cancelReason?: string;
 }
 
